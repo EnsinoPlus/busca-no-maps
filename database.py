@@ -8,6 +8,11 @@ import sqlite3
 # em outra pasta quando o script roda de um diretorio diferente).
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "leads.db")
 
+
+def get_db_path():
+    """Retorna o banco configurado, permitindo volume persistente em produção."""
+    return os.path.abspath(os.environ.get("LEADS_DB_PATH", DB_PATH))
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS leads (
     place_id TEXT PRIMARY KEY,
@@ -60,7 +65,11 @@ def _migrate(conn):
 
 
 def get_connection():
-    conn = sqlite3.connect(DB_PATH)
+    db_path = get_db_path()
+    os.makedirs(os.path.dirname(db_path), exist_ok=True)
+    conn = sqlite3.connect(db_path, timeout=5)
+    conn.execute("PRAGMA busy_timeout = 5000")
+    conn.execute("PRAGMA journal_mode = WAL")
     conn.execute(SCHEMA)
     _migrate(conn)
     return conn
@@ -143,10 +152,15 @@ def export_csv(conn, filepath="leads_export.csv", filtro=None, busca=None):
         "website", "category", "rating", "ratings_total", "latitude", "longitude",
         "search_query", "created_at",
     ]
+    def _safe_cell(value):
+        if isinstance(value, str) and value.lstrip().startswith(("=", "+", "-", "@")):
+            return "'" + value
+        return value
+
     with open(filepath, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow(headers)
-        writer.writerows(rows)
+        writer.writerows([_safe_cell(value) for value in row] for row in rows)
     return filepath
 
 

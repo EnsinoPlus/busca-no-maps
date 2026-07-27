@@ -12,7 +12,7 @@ do codigo (main.py / app.py usam place_id, name, formatted_address, etc).
 """
 import os
 import time
-import json
+
 import requests
 
 LEGACY_TEXT_URL = "https://maps.googleapis.com/maps/api/place/textsearch/json"

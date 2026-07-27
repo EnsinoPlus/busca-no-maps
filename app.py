@@ -8,11 +8,29 @@ Como rodar:
 
 Depois abra no navegador: http://127.0.0.1:5000
 """
-import os
+import hmac
 import logging
+import os
+import secrets
+import tempfile
+import threading
+import time
+import urllib.parse
+from collections import defaultdict, deque
 from datetime import datetime, timezone
 
-from flask import Flask, request, Response, redirect, url_for
+from flask import (
+    Flask,
+    Response,
+    abort,
+    g,
+    jsonify,
+    redirect,
+    request,
+    session,
+    url_for,
+)
+from markupsafe import escape
 
 
 def _load_env():
@@ -34,11 +52,155 @@ def _load_env():
 _load_env()
 
 
-import places_api
-import email_finder
 import database
+import email_finder
+import places_api
 
 app = Flask(__name__)
+app.secret_key = os.environ.get("APP_SECRET_KEY") or secrets.token_hex(32)
+app.config["MAX_CONTENT_LENGTH"] = 64 * 1024
+app.config["SESSION_COOKIE_HTTPONLY"] = True
+app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+app.config["SESSION_COOKIE_SECURE"] = os.environ.get("APP_SECURE_COOKIES") == "1"
+
+AUTH_FAILURE_LIMIT = 5
+SEARCH_RATE_LIMIT = 3
+RATE_LIMIT_WINDOW = 60
+_rate_limit_events = defaultdict(deque)
+_rate_limit_lock = threading.Lock()
+_monotonic = time.monotonic
+
+
+def _rate_limit_allows(bucket, client_key, limit, window=RATE_LIMIT_WINDOW):
+    now = _monotonic()
+    key = (bucket, client_key)
+    with _rate_limit_lock:
+        events = _rate_limit_events[key]
+        cutoff = now - window
+        while events and events[0] <= cutoff:
+            events.popleft()
+        if len(events) >= limit:
+            return False
+        events.append(now)
+        return True
+
+
+def _reset_rate_limits():
+    """Limpa o limitador em memória (também torna os testes determinísticos)."""
+    with _rate_limit_lock:
+        _rate_limit_events.clear()
+
+
+def _is_production():
+    return (
+        os.environ.get("RENDER", "").lower() in {"1", "true", "yes"}
+        or os.environ.get("APP_ENV", "").lower() == "production"
+        or os.environ.get("FLASK_ENV", "").lower() == "production"
+    )
+
+
+@app.before_request
+def _require_auth():
+    """Protege produção e mantém o uso local sem autenticação opcional."""
+    if request.endpoint == "health":
+        return None
+    username = os.environ.get("APP_USERNAME")
+    password = os.environ.get("APP_PASSWORD")
+    secret_key = os.environ.get("APP_SECRET_KEY")
+    if _is_production() and (not username or not password or not secret_key):
+        return Response("Configuração de segurança incompleta.", status=503)
+    if not username and not password:
+        return None
+    if not username or not password:
+        return Response("Configuração de autenticação incompleta.", status=503)
+    auth = request.authorization
+    valid = bool(
+        auth
+        and hmac.compare_digest(auth.username or "", username)
+        and hmac.compare_digest(auth.password or "", password)
+    )
+    if not valid:
+        if not _rate_limit_allows("auth", request.remote_addr or "unknown", AUTH_FAILURE_LIMIT):
+            return Response(
+                "Muitas tentativas de autenticação.",
+                status=429,
+                headers={"Retry-After": "60"},
+            )
+        return Response(
+            "Autenticação necessária.",
+            status=401,
+            headers={"WWW-Authenticate": 'Basic realm="Leads Maps"'},
+        )
+    return None
+
+
+@app.before_request
+def _limit_search_posts():
+    if (
+        request.endpoint == "buscar"
+        and request.method == "POST"
+        and not _rate_limit_allows("buscar", request.remote_addr or "unknown", SEARCH_RATE_LIMIT)
+    ):
+        return Response(
+            "Muitas buscas. Tente novamente em instantes.",
+            status=429,
+            headers={"Retry-After": "60"},
+        )
+    return None
+
+
+@app.before_request
+def _csrf_protect():
+    if request.method != "POST":
+        return
+    expected = session.get("csrf_token", "")
+    received = request.form.get("csrf_token", "") or request.headers.get("X-CSRF-Token", "")
+    if not expected or not received or not hmac.compare_digest(expected, received):
+        abort(400, description="Token de segurança inválido ou ausente.")
+    return
+
+
+def _csrf_token():
+    token = session.get("csrf_token")
+    if not token:
+        token = secrets.token_urlsafe(32)
+        session["csrf_token"] = token
+    return token
+
+
+def _csrf_input():
+    return f'<input type="hidden" name="csrf_token" value="{_csrf_token()}">'
+
+
+@app.after_request
+def _security_headers(response):
+    response.headers["Content-Security-Policy"] = (
+        "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; "
+        "object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'"
+    )
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers["Permissions-Policy"] = "geolocation=(), microphone=(), camera=()"
+    return response
+
+
+@app.get("/health")
+def health():
+    return jsonify(status="ok")
+
+
+def _get_db():
+    if "db" not in g:
+        g.db = database.get_connection()
+    return g.db
+
+
+@app.teardown_appcontext
+def _close_db(_error=None):
+    conn = g.pop("db", None)
+    if conn is not None:
+        conn.close()
+
 
 # Log em arquivo + console
 logging.basicConfig(
@@ -52,6 +214,8 @@ logging.basicConfig(
 log = logging.getLogger("leads_maps")
 
 PAGE_SIZE = 10
+MAX_SYNC_QUERIES = 2
+MAX_SYNC_RESULTS_PER_QUERY = 5
 
 CATEGORY_TRAD = {
     "lawyer": "Advocacia",
@@ -278,7 +442,7 @@ def render_page(title, subtitle, body):
           <div class="logo">🔎</div>
           <div>
             <h1>Leads Maps</h1>
-            <p>{subtitle}</p>
+            <p>{escape(subtitle)}</p>
           </div>
         </div>
         <nav class="nav">
@@ -293,31 +457,50 @@ def render_page(title, subtitle, body):
     """
 
 
+def _safe_http_url(value):
+    if not value:
+        return None
+    try:
+        parsed = urllib.parse.urlsplit(str(value))
+    except ValueError:
+        return None
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
+        return None
+    return str(value)
+
+
 def _render_tabela(rows):
     if not rows:
         return '<div class="empty">Nenhum lead neste grupo.</div>'
     table_rows = ""
     for row in rows:
-        name, address, phone, email, website, category, rating, search_query = row
+        if len(row) not in (8, 9):
+            raise ValueError("Cada linha deve ter 8 ou 9 colunas.")
+        name, address, phone, email, website, category, rating, search_query = row[:8]
+        email_sugerido = row[8] if len(row) == 9 else None
         if email:
-            email_badge = f'<span class="badge badge-yes">{email}</span>'
-        elif len(row) > 8 and row[8]:
-            # existe coluna email_sugerido (quando passamos tupla extendida)
-            email_badge = f'<span class="badge badge-sug">sugerido: {row[8]}</span>'
+            email_badge = f'<span class="badge badge-yes">{escape(email)}</span>'
+        elif email_sugerido:
+            email_badge = f'<span class="badge badge-sug">sugerido: {escape(email_sugerido)}</span>'
         else:
             email_badge = '<span class="badge badge-no">sem e-mail</span>'
-        website_link = f'<a class="site-link" href="{website}" target="_blank">site ↗</a>' if website else "-"
+        website_safe = _safe_http_url(website)
+        website_link = (
+            f'<a class="site-link" href="{escape(website_safe)}" target="_blank" '
+            'rel="noopener noreferrer">site ↗</a>'
+            if website_safe else "-"
+        )
         cat = _traduzir_categoria(category)
         table_rows += f"""
         <tr>
-          <td><b>{name or '-'}</b></td>
-          <td>{address or '-'}</td>
-          <td>{phone or '-'}</td>
+          <td><b>{escape(name or '-')}</b></td>
+          <td>{escape(address or '-')}</td>
+          <td>{escape(phone or '-')}</td>
           <td>{email_badge}</td>
           <td>{website_link}</td>
-          <td>{cat}</td>
-          <td>{rating or '-'}</td>
-          <td>{search_query or '-'}</td>
+          <td>{escape(cat)}</td>
+          <td>{escape(rating or '-')}</td>
+          <td>{escape(search_query or '-')}</td>
         </tr>
         """
     return f"""
@@ -351,7 +534,7 @@ def _pager_html(pagina, total_pages, base_args):
 
 @app.route("/")
 def home():
-    conn = database.get_connection()
+    conn = _get_db()
     total = database.count_leads(conn)
     body = f"""
     <div class="card">
@@ -360,11 +543,12 @@ def home():
         Encontre negócios no Google Maps e capture telefone, site e e-mail de contato.
       </p>
       <form method="POST" action="/buscar">
+        {_csrf_input()}
         <label>Termos de busca (um por linha)</label>
         <textarea name="queries" rows="4" placeholder="advogado trabalhista Mossoro RN&#10;contador Mossoro RN" required></textarea>
 
         <label>Limite de resultados por termo (opcional)</label>
-        <input type="number" name="limit" placeholder="ex: 20">
+        <input type="number" name="limit" min="1" max="{MAX_SYNC_RESULTS_PER_QUERY}" placeholder="ex: 5">
 
         <label class="check">
           <input type="checkbox" name="somente_com_email" checked>
@@ -386,10 +570,17 @@ def home():
 def buscar():
     queries = [q.strip() for q in request.form.get("queries", "").splitlines() if q.strip()]
     limit_raw = request.form.get("limit", "").strip()
-    limit = int(limit_raw) if limit_raw else None
+    if not queries or len(queries) > MAX_SYNC_QUERIES or any(len(query) > 200 for query in queries):
+        abort(400, description=f"Informe de 1 a {MAX_SYNC_QUERIES} termos, com até 200 caracteres cada.")
+    try:
+        limit = int(limit_raw) if limit_raw else MAX_SYNC_RESULTS_PER_QUERY
+    except ValueError:
+        abort(400, description="O limite precisa ser um número inteiro.")
+    if not 1 <= limit <= MAX_SYNC_RESULTS_PER_QUERY:
+        abort(400, description=f"O limite deve estar entre 1 e {MAX_SYNC_RESULTS_PER_QUERY}.")
     somente_com_email = request.form.get("somente_com_email") == "on"
 
-    conn = database.get_connection()
+    conn = _get_db()
     log_lines = []
     _checar_api_key()
 
@@ -445,7 +636,7 @@ def buscar():
         if somente_com_email:
             log_lines.append(f"  → {salvos} salvo(s), {pulados} pulado(s) por falta de e-mail.")
 
-    log_html = "\n".join(log_lines)
+    log_html = escape("\n".join(log_lines))
     body = f"""
     <div class="card">
       <h3 class="section-title">Log da busca</h3>
@@ -461,7 +652,7 @@ def buscar():
 
 @app.route("/leads")
 def leads():
-    conn = database.get_connection()
+    conn = _get_db()
     filtro = request.args.get("filtro", "todos")
     busca = request.args.get("busca", "").strip()
     try:
@@ -475,22 +666,14 @@ def leads():
 
     # aplica filtro de e-mail na visualizacao
     if filtro == "com_email":
-        com, sem = com, []
+        sem = []
     elif filtro == "sem_email":
-        com, sem = [], sem
+        com = []
 
     com_p, pg_c, tot_c = _paginar(com, pagina)
     sem_p, pg_s, tot_s = _paginar(sem, pagina)
 
-    # coluna extra email_sugerido para renderizacao (None quando nao existe)
-    def _com_sugerido(rows):
-        out = []
-        for r in rows:
-            # rows da query_leads nao trazem sugerido; buscamos separado se preciso
-            out.append(r)
-        return out
-
-    base_args = f"filtro={filtro}&busca={busca}"
+    base_args = urllib.parse.urlencode({"filtro": filtro, "busca": busca})
     body = f"""
     <div class="btn-row" style="margin-bottom:22px;">
       <a class="btn btn-secondary" href="/">🔎 Nova busca</a>
@@ -510,7 +693,7 @@ def leads():
         </div>
         <div style="flex:2; min-width:240px;">
           <label style="margin-top:0;">Buscar por termo</label>
-          <input type="text" name="busca" value="{busca}" placeholder="ex: Mossoró, Fortaleza...">
+          <input type="text" name="busca" value="{escape(busca)}" placeholder="ex: Mossoró, Fortaleza...">
         </div>
         <button class="btn" type="submit" style="margin-top:0;">🔍 Filtrar</button>
       </form>
@@ -541,7 +724,7 @@ def leads():
 
 @app.route("/exportar")
 def exportar_pagina():
-    conn = database.get_connection()
+    conn = _get_db()
     total = database.count_leads(conn)
     com = len(database.query_leads(conn, filtro="com_email"))
     sem = len(database.query_leads(conn, filtro="sem_email"))
@@ -580,10 +763,18 @@ def exportar_csv():
     if filtro not in ("todos", "com_email", "sem_email"):
         filtro = "todos"
 
-    conn = database.get_connection()
-    path = database.export_csv(conn, filtro=filtro or None, busca=busca or None)
-    with open(path, "r", encoding="utf-8") as f:
-        content = f.read()
+    conn = _get_db()
+    with tempfile.NamedTemporaryFile(prefix="leads_export_", suffix=".csv", delete=False) as temp_file:
+        path = temp_file.name
+    try:
+        database.export_csv(conn, filepath=path, filtro=filtro or None, busca=busca or None)
+        with open(path, "r", encoding="utf-8") as f:
+            content = f.read()
+    finally:
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
     return Response(
         content,
         mimetype="text/csv",
@@ -596,7 +787,7 @@ def limpar():
     if request.method == "POST":
         confirm = request.form.get("confirm", "")
         if confirm == "LIMPAR":
-            conn = database.get_connection()
+            conn = _get_db()
             database.apagar_todos(conn)
             log.warning("Banco de leads apagado pelo usuario.")
             return redirect(url_for("leads"))
@@ -606,7 +797,7 @@ def limpar():
 
 
 def _limpar_form():
-    return """
+    return f"""
     <div class="card">
       <h3 class="section-title">🗑️ Apagar todos os leads</h3>
       <p style="color:var(--text-muted); font-size:13px;">
@@ -614,6 +805,7 @@ def _limpar_form():
         Não pode ser desfeita.
       </p>
       <form method="POST" action="/limpar">
+        {_csrf_input()}
         <label>Digite <b>LIMPAR</b> para confirmar</label>
         <input type="text" name="confirm" placeholder="LIMPAR">
         <button class="btn btn-danger" type="submit">Apagar tudo</button>

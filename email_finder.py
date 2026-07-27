@@ -13,10 +13,14 @@ Retorno: (email_confirmado, fonte, email_sugerido)
   - fonte: 'mailto' | 'jsonld' | 'texto' | None
   - email_sugerido: palpite tipo contato@dominio.com.br, ou None
 """
-import re
+import ipaddress
 import json
-import requests
+import re
+import socket
 import urllib.parse
+
+import requests
+from requests.adapters import HTTPAdapter
 
 EMAIL_REGEX = re.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}")
 MAILTO_REGEX = re.compile(r'mailto:([^"\'\?\s>]+)', re.IGNORECASE)
@@ -36,6 +40,7 @@ HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; LeadsMapsBot/1.0)"}
 
 # Backoff simples para nao sobrecarregar o site
 REQUEST_TIMEOUT = 8
+MAX_RESPONSE_BYTES = 1_000_000
 
 
 def _valid(email):
@@ -79,11 +84,95 @@ def _clean(email):
 def _domain(website_url):
     try:
         netloc = urllib.parse.urlparse(website_url).netloc.lower()
-        if netloc.startswith("www."):
-            netloc = netloc[4:]
+        netloc = netloc.removeprefix("www.")
         return netloc or None
-    except Exception:
+    except (TypeError, ValueError):
         return None
+
+
+def _resolve_public_url(url):
+    """Valida a URL e retorna os componentes mais um IP público já resolvido."""
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        if parsed.scheme.lower() not in {"http", "https"}:
+            return None
+        if not parsed.hostname or parsed.username or parsed.password:
+            return None
+        port = parsed.port or (443 if parsed.scheme.lower() == "https" else 80)
+        addresses = sorted({
+            item[4][0]
+            for item in socket.getaddrinfo(parsed.hostname, port, type=socket.SOCK_STREAM)
+        })
+        if not addresses or not all(ipaddress.ip_address(address).is_global for address in addresses):
+            return None
+        return parsed, addresses[0]
+    except (ValueError, OSError):
+        return None
+
+
+def _is_safe_public_url(url):
+    """Aceita apenas HTTP(S) cujo DNS resolva exclusivamente para IPs públicos."""
+    return _resolve_public_url(url) is not None
+
+
+class _PinnedIPAdapter(HTTPAdapter):
+    """Conecta ao IP validado sem perder SNI/verificação TLS do hostname original."""
+
+    def __init__(self, tls_hostname):
+        self._tls_hostname = tls_hostname
+        super().__init__()
+
+    def init_poolmanager(self, connections, maxsize, block=False, **pool_kwargs):
+        pool_kwargs["server_hostname"] = self._tls_hostname
+        pool_kwargs["assert_hostname"] = self._tls_hostname
+        return super().init_poolmanager(connections, maxsize, block=block, **pool_kwargs)
+
+
+def _fetch_html(url, timeout):
+    resolved = _resolve_public_url(url)
+    if resolved is None:
+        return None
+    parsed, address = resolved
+    ip_netloc = f"[{address}]" if ipaddress.ip_address(address).version == 6 else address
+    if parsed.port is not None:
+        ip_netloc = f"{ip_netloc}:{parsed.port}"
+    pinned_url = urllib.parse.urlunsplit(
+        (parsed.scheme, ip_netloc, parsed.path or "/", parsed.query, "")
+    )
+    default_port = 443 if parsed.scheme.lower() == "https" else 80
+    host_header = parsed.hostname
+    if parsed.port is not None and parsed.port != default_port:
+        host_header = f"{host_header}:{parsed.port}"
+    session = requests.Session()
+    session.trust_env = False
+    if parsed.scheme.lower() == "https":
+        session.mount("https://", _PinnedIPAdapter(parsed.hostname))
+    try:
+        resp = session.get(
+            pinned_url,
+            headers={**HEADERS, "Host": host_header},
+            timeout=timeout,
+            allow_redirects=False,
+            stream=True,
+        )
+        if resp.status_code != 200:
+            return None
+        content_type = resp.headers.get("Content-Type", "").lower()
+        if content_type and "text/html" not in content_type and "application/xhtml+xml" not in content_type:
+            return None
+        chunks = []
+        total = 0
+        for chunk in resp.iter_content(chunk_size=16_384):
+            total += len(chunk)
+            if total > MAX_RESPONSE_BYTES:
+                return None
+            chunks.append(chunk)
+        encoding = resp.encoding or "utf-8"
+        return b"".join(chunks).decode(encoding, errors="replace")
+    except requests.RequestException:
+        return None
+    finally:
+        session.close()
 
 
 def _suggest(website_url):
@@ -102,20 +191,17 @@ def find_email(website_url, timeout=REQUEST_TIMEOUT):
     if not website_url:
         return None, None, None
 
+    if not _is_safe_public_url(website_url):
+        return None, None, None
+
     base = website_url.rstrip("/")
-    domain = _domain(website_url)
     confirmados = set()
 
     for path in CANDIDATE_PATHS:
         url = base + path
-        try:
-            resp = requests.get(url, headers=HEADERS, timeout=timeout)
-            if resp.status_code != 200:
-                continue
-        except requests.RequestException:
+        html = _fetch_html(url, timeout)
+        if html is None:
             continue
-
-        html = resp.text
 
         mailto = _from_mailto(html)
         if mailto:

@@ -11,9 +11,9 @@ import argparse
 import sys
 from datetime import datetime, timezone
 
-import places_api
-import email_finder
 import database
+import email_finder
+import places_api
 
 
 def process_query(conn, query, limit=None, somente_com_email=False):
@@ -40,7 +40,7 @@ def process_query(conn, query, limit=None, somente_com_email=False):
         email, email_fonte, email_sugerido = email_finder.find_email(website) if website else (None, None, None)
 
         if somente_com_email and not email:
-            print(f"        ⏭ sem e-mail, pulado")
+            print("        ⏭ sem e-mail, pulado")
             continue
 
         print(f"        📞 {phone or '(sem telefone)'}   ✉️ {email or '(sem e-mail encontrado)'}")

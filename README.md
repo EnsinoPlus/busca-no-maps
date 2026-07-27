@@ -47,6 +47,34 @@ python main.py --file termos.txt --csv
 Para abrir o `.db` visualmente, use um programa como o DB Browser for SQLite
 (gratuito).
 
+## 5. Interface web local
+
+```bash
+python app.py
+```
+
+Abra `http://127.0.0.1:5000`. Para exigir login também no computador local,
+configure `APP_USERNAME`, `APP_PASSWORD` e `APP_SECRET_KEY` no `.env`.
+
+## 6. Publicação no Render
+
+O repositório inclui um `render.yaml`. No painel do Render, crie um **Blueprint**
+a partir deste repositório e informe, quando solicitado:
+
+- `GOOGLE_MAPS_API_KEY`: chave restrita à Places API;
+- `APP_PASSWORD`: uma senha forte e exclusiva para acessar a interface.
+
+O usuário inicial é `ensinoplus`. Nunca grave senhas ou chaves no GitHub.
+
+> **Persistência no plano gratuito:** o serviço gratuito usa `/tmp/leads.db` e os
+> leads podem ser apagados ao reiniciar ou publicar uma nova versão. Para uso
+> permanente, mude o serviço para um plano pago com disco persistente e configure
+> `LEADS_DB_PATH` para o ponto de montagem do disco.
+
+O endpoint `/health` é público apenas para monitoramento. Todas as demais páginas
+ficam protegidas por autenticação HTTP Basic, CSRF, cabeçalhos defensivos e limites
+de entrada.
+
 ## Observações importantes
 
 - **Custo**: cada busca de texto + detalhes de cada resultado consome cota da API.

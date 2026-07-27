@@ -3,10 +3,10 @@ Usado pelo atalho da Area de Trabalho 'busca no Maps'.
 Mantem UMA janela unica aberta (loop) ate o usuario fechar (Ctrl+C).
 """
 import os
-import sys
-import time
-import threading
 import subprocess
+import threading
+import time
+import urllib.error
 import urllib.request
 
 # Carrega variaveis do .env (sem dependencias externas)
@@ -29,7 +29,7 @@ def _server_ja_no_ar():
     try:
         urllib.request.urlopen(URL, timeout=2)
         return True
-    except Exception:
+    except (urllib.error.URLError, TimeoutError, OSError):
         return False
 
 
@@ -72,7 +72,7 @@ def main():
 if __name__ == "__main__":
     try:
         main()
-    except Exception as e:
+    except Exception:  # noqa: BLE001 - inicializador deve exibir qualquer falha fatal
         import traceback
         traceback.print_exc()
         print("\nOcorreu um erro. Pressione Enter para fechar.")
