@@ -1,0 +1,24 @@
+# Segredos e dados locais (não versionar)
+.env
+.env.*
+!.env.example
+*.db
+leads_export*.csv
+*.log
+
+# Ambientes e caches Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Arquivos do sistema/editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
