@@ -553,7 +553,7 @@ def home():
         <input type="number" name="limit" min="1" max="{MAX_SYNC_RESULTS_PER_QUERY}" placeholder="ex: 5">
 
         <label class="check">
-          <input type="checkbox" name="somente_com_email" checked>
+          <input type="checkbox" name="somente_com_email">
           Só salvar negócios em que encontrou e-mail (pula os sem e-mail)
         </label>
 

@@ -259,6 +259,17 @@ def test_basic_auth_failures_are_rate_limited_in_memory(monkeypatch):
     assert statuses[-1] == 429
 
 
+def test_home_does_not_hide_results_without_email_by_default(monkeypatch, tmp_path):
+    monkeypatch.setenv("APP_PUBLIC_ACCESS", "1")
+    monkeypatch.setenv("LEADS_DB_PATH", str(tmp_path / "home-default.db"))
+
+    html = webapp.app.test_client().get("/").get_data(as_text=True)
+    checkbox = re.search(r'<input type="checkbox" name="somente_com_email"[^>]*>', html)
+
+    assert checkbox is not None
+    assert "checked" not in checkbox.group(0)
+
+
 def test_buscar_posts_are_rate_limited_in_memory(monkeypatch, tmp_path):
     monkeypatch.delenv("APP_USERNAME", raising=False)
     monkeypatch.delenv("APP_PASSWORD", raising=False)
