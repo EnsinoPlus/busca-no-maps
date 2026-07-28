@@ -220,6 +220,17 @@ def test_production_fails_closed_when_auth_or_secret_is_missing(monkeypatch):
     assert webapp.app.test_client().get("/").status_code == 503
 
 
+def test_explicit_public_access_bypasses_basic_auth_in_production(monkeypatch, tmp_path):
+    monkeypatch.setenv("APP_ENV", "production")
+    monkeypatch.setenv("APP_PUBLIC_ACCESS", "1")
+    monkeypatch.setenv("APP_USERNAME", "configured-user")
+    monkeypatch.setenv("APP_PASSWORD", "configured-password")
+    monkeypatch.setenv("APP_SECRET_KEY", "configured-secret")
+    monkeypatch.setenv("LEADS_DB_PATH", str(tmp_path / "public.db"))
+
+    assert webapp.app.test_client().get("/").status_code == 200
+
+
 def test_local_mode_allows_no_authentication_configuration(monkeypatch, tmp_path):
     monkeypatch.delenv("RENDER", raising=False)
     monkeypatch.delenv("APP_ENV", raising=False)

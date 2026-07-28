@@ -101,8 +101,10 @@ def _is_production():
 
 @app.before_request
 def _require_auth():
-    """Protege produção e mantém o uso local sem autenticação opcional."""
+    """Protege produção, salvo quando o acesso público for explicitamente ativado."""
     if request.endpoint == "health":
+        return None
+    if os.environ.get("APP_PUBLIC_ACCESS", "").lower() in {"1", "true", "yes"}:
         return None
     username = os.environ.get("APP_USERNAME")
     password = os.environ.get("APP_PASSWORD")

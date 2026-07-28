@@ -71,9 +71,14 @@ O usuário inicial é `ensinoplus`. Nunca grave senhas ou chaves no GitHub.
 > permanente, mude o serviço para um plano pago com disco persistente e configure
 > `LEADS_DB_PATH` para o ponto de montagem do disco.
 
-O endpoint `/health` é público apenas para monitoramento. Todas as demais páginas
-ficam protegidas por autenticação HTTP Basic, CSRF, cabeçalhos defensivos e limites
-de entrada.
+O endpoint `/health` é público para monitoramento. Por padrão, as demais páginas
+ficam protegidas por autenticação HTTP Basic. Para abrir explicitamente toda a
+interface sem login, configure `APP_PUBLIC_ACCESS=1`. Essa opção mantém CSRF,
+cabeçalhos defensivos, rate limiting e limites de entrada, mas permite que qualquer
+pessoa use a busca e visualize/exporte os leads armazenados.
+
+> **Atenção:** o acesso público pode consumir a cota paga da Google Places API e
+> expõe os leads salvos. Use restrições e alertas de orçamento no Google Cloud.
 
 ## Observações importantes
 
