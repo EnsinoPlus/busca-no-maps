@@ -259,14 +259,17 @@ def test_basic_auth_failures_are_rate_limited_in_memory(monkeypatch):
     assert statuses[-1] == 429
 
 
-def test_home_explains_that_only_contacts_with_email_are_saved(monkeypatch, tmp_path):
+def test_home_explains_email_target_and_separate_lists(monkeypatch, tmp_path):
     monkeypatch.setenv("APP_PUBLIC_ACCESS", "1")
-    monkeypatch.setenv("LEADS_DB_PATH", str(tmp_path / "home-email-only.db"))
+    monkeypatch.setenv("LEADS_DB_PATH", str(tmp_path / "home-separated.db"))
 
     html = webapp.app.test_client().get("/").get_data(as_text=True)
 
     assert 'name="somente_com_email"' not in html
-    assert "Somente contatos com e-mail serão contabilizados e salvos." in html
+    assert "A quantidade solicitada conta somente contatos com e-mail." in html
+    assert "Contatos sem e-mail ficam separados mais abaixo na lista." in html
+    assert "0 contato(s) com e-mail" in html
+    assert "0 contato(s) sem e-mail, em lista separada" in html
 
 
 def test_home_loads_search_spinner_behavior(monkeypatch, tmp_path):
@@ -287,25 +290,37 @@ def test_home_loads_search_spinner_behavior(monkeypatch, tmp_path):
     assert "button.disabled = true" in javascript
 
 
-def test_buscar_saves_and_counts_only_contacts_with_email(monkeypatch, tmp_path):
+def test_buscar_fills_email_target_and_lists_without_email_separately(monkeypatch, tmp_path):
     monkeypatch.setenv("APP_PUBLIC_ACCESS", "1")
-    monkeypatch.setenv("LEADS_DB_PATH", str(tmp_path / "email-only.db"))
+    monkeypatch.setenv("LEADS_DB_PATH", str(tmp_path / "separated-leads.db"))
     webapp._reset_rate_limits()
     results = [
-        {"place_id": "with-email", "name": "Com Email", "types": [], "geometry": {"location": {}}},
-        {"place_id": "without-email", "name": "Sem Email", "types": [], "geometry": {"location": {}}},
+        {"place_id": place_id, "name": place_id, "types": [], "geometry": {"location": {}}}
+        for place_id in ("no-1", "yes-1", "no-2", "yes-2", "yes-3")
     ]
-    details = {
-        "with-email": {"name": "Com Email", "website": "https://com-email.example", "formatted_phone_number": "1"},
-        "without-email": {"name": "Sem Email", "website": None, "formatted_phone_number": "2"},
-    }
-    monkeypatch.setattr(webapp.places_api, "text_search", lambda *args, **kwargs: results)
-    monkeypatch.setattr(webapp.places_api, "place_details", lambda place_id: details[place_id])
-    monkeypatch.setattr(
-        webapp.email_finder,
-        "find_email",
-        lambda website: ("contato@com-email.example", website, False),
-    )
+    requested_candidate_limits = []
+    details_calls = []
+
+    def fake_search(*args, **kwargs):
+        requested_candidate_limits.append(kwargs["max_results"])
+        return results
+
+    def fake_details(place_id):
+        details_calls.append(place_id)
+        return {
+            "name": place_id,
+            "website": f"https://{place_id}.example",
+            "formatted_phone_number": place_id,
+        }
+
+    def fake_find_email(website):
+        if "yes-" in website:
+            return (f"contato@{website.removeprefix('https://')}", website, False)
+        return (None, None, None)
+
+    monkeypatch.setattr(webapp.places_api, "text_search", fake_search)
+    monkeypatch.setattr(webapp.places_api, "place_details", fake_details)
+    monkeypatch.setattr(webapp.email_finder, "find_email", fake_find_email)
     client = webapp.app.test_client()
     home = client.get("/")
     token = re.search(r'name="csrf_token" value="([^"]+)"', home.get_data(as_text=True)).group(1)
@@ -317,15 +332,20 @@ def test_buscar_saves_and_counts_only_contacts_with_email(monkeypatch, tmp_path)
 
     conn = database.get_connection()
     try:
-        saved = database.query_leads(conn)
+        with_email = database.query_leads(conn, filtro="com_email")
+        without_email = database.query_leads(conn, filtro="sem_email")
     finally:
         conn.close()
     text = response.get_data(as_text=True)
+    leads_html = client.get("/leads").get_data(as_text=True)
     assert response.status_code == 200
-    assert len(saved) == 1 and saved[0][0] == "Com Email"
-    assert "1 contato(s) com e-mail salvo(s)." in text
-    assert "2 resultado(s) encontrado(s)." not in text
-    assert "pulado(s)" not in text
+    assert requested_candidate_limits == [webapp.MAX_SEARCH_CANDIDATES]
+    assert details_calls == ["no-1", "yes-1", "no-2", "yes-2"]
+    assert len(with_email) == 2
+    assert len(without_email) == 2
+    assert "2 de 2 contato(s) com e-mail encontrado(s)." in text
+    assert "2 contato(s) sem e-mail listado(s) separadamente." in text
+    assert leads_html.index("Com e-mail") < leads_html.index("Sem e-mail")
 
 
 def test_buscar_posts_are_rate_limited_in_memory(monkeypatch, tmp_path):
@@ -489,7 +509,7 @@ def test_buscar_enforces_small_synchronous_work_limits(monkeypatch, tmp_path):
     assert too_many_queries.status_code == 400
     assert too_many_results.status_code == 400
     assert default_limit.status_code == 200
-    assert received_limits == [5]
+    assert received_limits == [webapp.MAX_SEARCH_CANDIDATES]
 
 
 def test_web_connection_is_closed_after_request(monkeypatch):

@@ -104,8 +104,13 @@ def upsert_lead(conn, lead: dict):
     conn.commit()
 
 
-def count_leads(conn):
-    return conn.execute("SELECT COUNT(*) FROM leads").fetchone()[0]
+def count_leads(conn, filtro=None):
+    sql = "SELECT COUNT(*) FROM leads"
+    if filtro == "com_email":
+        sql += " WHERE email IS NOT NULL AND email != ''"
+    elif filtro == "sem_email":
+        sql += " WHERE email IS NULL OR email = ''"
+    return conn.execute(sql).fetchone()[0]
 
 
 def query_leads(conn, filtro=None, busca=None):

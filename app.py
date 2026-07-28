@@ -218,6 +218,7 @@ log = logging.getLogger("leads_maps")
 PAGE_SIZE = 10
 MAX_SYNC_QUERIES = 2
 MAX_SYNC_RESULTS_PER_QUERY = 5
+MAX_SEARCH_CANDIDATES = 20
 
 CATEGORY_TRAD = {
     "lawyer": "Advocacia",
@@ -545,10 +546,12 @@ def _pager_html(pagina, total_pages, base_args):
 @app.route("/")
 def home():
     conn = _get_db()
-    total = database.count_leads(conn)
+    com_email = database.count_leads(conn, filtro="com_email")
+    sem_email = database.count_leads(conn, filtro="sem_email")
     body = f"""
     <div class="card">
-      <div class="stat">📊 {total} lead(s) salvos até agora</div>
+      <div class="stat">✉️ {com_email} contato(s) com e-mail</div>
+      <div class="stat">🚫 {sem_email} contato(s) sem e-mail, em lista separada</div>
       <p style="color:var(--text-muted); font-size:13px; margin-top:16px;">
         Encontre negócios no Google Maps e capture telefone, site e e-mail de contato.
       </p>
@@ -561,7 +564,7 @@ def home():
         <input type="number" name="limit" min="1" max="{MAX_SYNC_RESULTS_PER_QUERY}" placeholder="ex: 5">
 
         <p style="color:var(--text-muted); font-size:13px; margin-top:16px;">
-          Somente contatos com e-mail serão contabilizados e salvos.
+          A quantidade solicitada conta somente contatos com e-mail. Contatos sem e-mail ficam separados mais abaixo na lista.
         </p>
 
         <button id="search-button" class="btn" type="submit">
@@ -598,14 +601,17 @@ def buscar():
     for query in queries:
         log_lines.append(f"🔎 Buscando: {query}")
         try:
-            results = places_api.text_search(query, max_results=limit)
+            results = places_api.text_search(query, max_results=MAX_SEARCH_CANDIDATES)
         except RuntimeError as e:
             log_lines.append(f"  ⚠ Erro: {e}")
             log.error("Erro na busca '%s': %s", query, e)
             continue
 
-        salvos = 0
+        com_email_salvos = 0
+        sem_email_salvos = 0
         for r in results:
+            if com_email_salvos >= limit:
+                break
             place_id = r.get("place_id")
             if not place_id:
                 continue
@@ -614,9 +620,6 @@ def buscar():
             website = details.get("website")
             phone = details.get("formatted_phone_number")
             email, email_fonte, email_sugerido = email_finder.find_email(website) if website else (None, None, None)
-
-            if not email:
-                continue
 
             lead = {
                 "place_id": place_id,
@@ -636,10 +639,18 @@ def buscar():
                 "created_at": datetime.now(timezone.utc).isoformat(),
             }
             database.upsert_lead(conn, lead)
-            salvos += 1
-            log_lines.append(f"    ✔ {lead['name']}  |  📞 {phone or '-'}  |  ✉️ {email or email_sugerido or '-'}")
+            if email:
+                com_email_salvos += 1
+                log_lines.append(f"    ✔ {lead['name']}  |  📞 {phone or '-'}  |  ✉️ {email}")
+            else:
+                sem_email_salvos += 1
 
-        log_lines.append(f"  → {salvos} contato(s) com e-mail salvo(s).")
+        log_lines.append(
+            f"  → {com_email_salvos} de {limit} contato(s) com e-mail encontrado(s)."
+        )
+        log_lines.append(
+            f"  → {sem_email_salvos} contato(s) sem e-mail listado(s) separadamente."
+        )
 
     log_html = escape("\n".join(log_lines))
     body = f"""
