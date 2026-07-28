@@ -73,16 +73,17 @@ def _new_text_search(query, max_results=None):
     _check_key()
     headers = {
         "X-Goog-Api-Key": API_KEY,
-        "X-Goog-FieldMask": FIELD_MASK,
+        "X-Goog-FieldMask": f"{FIELD_MASK},nextPageToken",
         "Content-Type": "application/json",
     }
     results = []
     page_token = None
     while True:
-        body = {"textQuery": query, "maxResultCount": 20}
+        remaining = max_results - len(results) if max_results else 20
+        body = {"textQuery": query, "pageSize": min(20, remaining)}
         if page_token:
             body["pageToken"] = page_token
-        # maxResultCount maximo da API New e 20; paginamos se precisar de mais
+        # pageSize maximo da API New e 20; paginamos se precisar de mais
         resp = _get(NEW_TEXT_URL, headers=headers, json_body=body)
         data = resp.json()
         if data.get("error"):

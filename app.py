@@ -218,7 +218,7 @@ log = logging.getLogger("leads_maps")
 PAGE_SIZE = 10
 MAX_SYNC_QUERIES = 2
 MAX_SYNC_RESULTS_PER_QUERY = 5
-MAX_SEARCH_CANDIDATES = 20
+MAX_SEARCH_CANDIDATES = 60
 
 CATEGORY_TRAD = {
     "lawyer": "Advocacia",

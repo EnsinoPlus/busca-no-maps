@@ -123,6 +123,37 @@ def test_render_tabela_accepts_exactly_eight_or_nine_columns():
     assert "sugerido@example.org" in html_nine
 
 
+def test_new_places_search_paginates_until_candidate_limit(monkeypatch):
+    calls = []
+    payloads = [
+        {"places": [{"id": "first"}], "nextPageToken": "next-token"},
+        {"places": [{"id": "second"}]},
+    ]
+
+    class FakeResponse:
+        def __init__(self, payload):
+            self._payload = payload
+
+        def json(self):
+            return self._payload
+
+    def fake_get(url, headers=None, json_body=None, **kwargs):
+        calls.append((headers, json_body))
+        return FakeResponse(payloads[len(calls) - 1])
+
+    monkeypatch.setattr(webapp.places_api, "API_KEY", "verification-key")
+    monkeypatch.setattr(webapp.places_api, "_get", fake_get)
+    monkeypatch.setattr(webapp.places_api.time, "sleep", lambda _seconds: None)
+
+    results = webapp.places_api._new_text_search("consulta", max_results=2)
+
+    assert [result["place_id"] for result in results] == ["first", "second"]
+    assert "nextPageToken" in calls[0][0]["X-Goog-FieldMask"]
+    assert calls[0][1]["pageSize"] == 2
+    assert calls[1][1]["pageSize"] == 1
+    assert calls[1][1]["pageToken"] == "next-token"
+
+
 def test_email_finder_rejects_local_and_private_destinations(monkeypatch):
     called = False
 
