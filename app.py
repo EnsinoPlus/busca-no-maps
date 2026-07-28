@@ -356,6 +356,14 @@ PAGE_STYLE = """
   }
   .btn:hover { transform: translateY(-1px); filter: brightness(1.06); box-shadow: 0 12px 26px rgba(99,102,241,0.45); }
   .btn:active { transform: translateY(0) scale(0.99); }
+  .btn:disabled { cursor: wait; opacity: 0.75; transform: none; }
+  .spinner {
+    width: 17px; height: 17px; border-radius: 50%;
+    border: 2px solid rgba(255,255,255,0.35); border-top-color: #fff;
+    animation: spinner-rotate .75s linear infinite;
+  }
+  .spinner[hidden] { display: none; }
+  @keyframes spinner-rotate { to { transform: rotate(360deg); } }
   .btn-secondary {
     background: var(--card); color: var(--text);
     border: 1px solid var(--border); box-shadow: none;
@@ -544,7 +552,7 @@ def home():
       <p style="color:var(--text-muted); font-size:13px; margin-top:16px;">
         Encontre negócios no Google Maps e capture telefone, site e e-mail de contato.
       </p>
-      <form method="POST" action="/buscar">
+      <form id="search-form" method="POST" action="/buscar">
         {_csrf_input()}
         <label>Termos de busca (um por linha)</label>
         <textarea name="queries" rows="4" placeholder="advogado trabalhista Mossoro RN&#10;contador Mossoro RN" required></textarea>
@@ -552,18 +560,21 @@ def home():
         <label>Limite de resultados por termo (opcional)</label>
         <input type="number" name="limit" min="1" max="{MAX_SYNC_RESULTS_PER_QUERY}" placeholder="ex: 5">
 
-        <label class="check">
-          <input type="checkbox" name="somente_com_email">
-          Só salvar negócios em que encontrou e-mail (pula os sem e-mail)
-        </label>
+        <p style="color:var(--text-muted); font-size:13px; margin-top:16px;">
+          Somente contatos com e-mail serão contabilizados e salvos.
+        </p>
 
-        <button class="btn" type="submit">🔎 Buscar leads</button>
+        <button id="search-button" class="btn" type="submit">
+          <span id="search-spinner" class="spinner" hidden aria-hidden="true"></span>
+          <span id="search-button-label">🔎 Buscar leads</span>
+        </button>
       </form>
     </div>
 
     <div class="btn-row">
       <a class="btn btn-secondary" href="/leads">📋 Ver leads salvos</a>
     </div>
+    <script src="/static/search.js" defer></script>
     """
     return render_page("Leads Maps", "Prospecção via Google Maps", body)
 
@@ -580,8 +591,6 @@ def buscar():
         abort(400, description="O limite precisa ser um número inteiro.")
     if not 1 <= limit <= MAX_SYNC_RESULTS_PER_QUERY:
         abort(400, description=f"O limite deve estar entre 1 e {MAX_SYNC_RESULTS_PER_QUERY}.")
-    somente_com_email = request.form.get("somente_com_email") == "on"
-
     conn = _get_db()
     log_lines = []
     _checar_api_key()
@@ -595,10 +604,7 @@ def buscar():
             log.error("Erro na busca '%s': %s", query, e)
             continue
 
-        log_lines.append(f"  {len(results)} resultado(s) encontrado(s).")
-
         salvos = 0
-        pulados = 0
         for r in results:
             place_id = r.get("place_id")
             if not place_id:
@@ -609,9 +615,7 @@ def buscar():
             phone = details.get("formatted_phone_number")
             email, email_fonte, email_sugerido = email_finder.find_email(website) if website else (None, None, None)
 
-            if somente_com_email and not email:
-                pulados += 1
-                log_lines.append(f"    ⏭ {details.get('name') or r.get('name')}  (sem e-mail, pulado)")
+            if not email:
                 continue
 
             lead = {
@@ -635,8 +639,7 @@ def buscar():
             salvos += 1
             log_lines.append(f"    ✔ {lead['name']}  |  📞 {phone or '-'}  |  ✉️ {email or email_sugerido or '-'}")
 
-        if somente_com_email:
-            log_lines.append(f"  → {salvos} salvo(s), {pulados} pulado(s) por falta de e-mail.")
+        log_lines.append(f"  → {salvos} contato(s) com e-mail salvo(s).")
 
     log_html = escape("\n".join(log_lines))
     body = f"""

@@ -259,15 +259,73 @@ def test_basic_auth_failures_are_rate_limited_in_memory(monkeypatch):
     assert statuses[-1] == 429
 
 
-def test_home_does_not_hide_results_without_email_by_default(monkeypatch, tmp_path):
+def test_home_explains_that_only_contacts_with_email_are_saved(monkeypatch, tmp_path):
     monkeypatch.setenv("APP_PUBLIC_ACCESS", "1")
-    monkeypatch.setenv("LEADS_DB_PATH", str(tmp_path / "home-default.db"))
+    monkeypatch.setenv("LEADS_DB_PATH", str(tmp_path / "home-email-only.db"))
 
     html = webapp.app.test_client().get("/").get_data(as_text=True)
-    checkbox = re.search(r'<input type="checkbox" name="somente_com_email"[^>]*>', html)
 
-    assert checkbox is not None
-    assert "checked" not in checkbox.group(0)
+    assert 'name="somente_com_email"' not in html
+    assert "Somente contatos com e-mail serão contabilizados e salvos." in html
+
+
+def test_home_loads_search_spinner_behavior(monkeypatch, tmp_path):
+    monkeypatch.setenv("APP_PUBLIC_ACCESS", "1")
+    monkeypatch.setenv("LEADS_DB_PATH", str(tmp_path / "spinner.db"))
+    client = webapp.app.test_client()
+
+    html = client.get("/").get_data(as_text=True)
+    script = client.get("/static/search.js")
+
+    assert 'id="search-form"' in html
+    assert 'id="search-spinner"' in html
+    assert 'src="/static/search.js"' in html
+    assert script.status_code == 200
+    javascript = script.get_data(as_text=True)
+    assert 'addEventListener("submit"' in javascript
+    assert "spinner.hidden = false" in javascript
+    assert "button.disabled = true" in javascript
+
+
+def test_buscar_saves_and_counts_only_contacts_with_email(monkeypatch, tmp_path):
+    monkeypatch.setenv("APP_PUBLIC_ACCESS", "1")
+    monkeypatch.setenv("LEADS_DB_PATH", str(tmp_path / "email-only.db"))
+    webapp._reset_rate_limits()
+    results = [
+        {"place_id": "with-email", "name": "Com Email", "types": [], "geometry": {"location": {}}},
+        {"place_id": "without-email", "name": "Sem Email", "types": [], "geometry": {"location": {}}},
+    ]
+    details = {
+        "with-email": {"name": "Com Email", "website": "https://com-email.example", "formatted_phone_number": "1"},
+        "without-email": {"name": "Sem Email", "website": None, "formatted_phone_number": "2"},
+    }
+    monkeypatch.setattr(webapp.places_api, "text_search", lambda *args, **kwargs: results)
+    monkeypatch.setattr(webapp.places_api, "place_details", lambda place_id: details[place_id])
+    monkeypatch.setattr(
+        webapp.email_finder,
+        "find_email",
+        lambda website: ("contato@com-email.example", website, False),
+    )
+    client = webapp.app.test_client()
+    home = client.get("/")
+    token = re.search(r'name="csrf_token" value="([^"]+)"', home.get_data(as_text=True)).group(1)
+
+    response = client.post(
+        "/buscar",
+        data={"queries": "consulta", "limit": "2", "csrf_token": token},
+    )
+
+    conn = database.get_connection()
+    try:
+        saved = database.query_leads(conn)
+    finally:
+        conn.close()
+    text = response.get_data(as_text=True)
+    assert response.status_code == 200
+    assert len(saved) == 1 and saved[0][0] == "Com Email"
+    assert "1 contato(s) com e-mail salvo(s)." in text
+    assert "2 resultado(s) encontrado(s)." not in text
+    assert "pulado(s)" not in text
 
 
 def test_buscar_posts_are_rate_limited_in_memory(monkeypatch, tmp_path):
