@@ -3,7 +3,10 @@
 .env.*
 !.env.example
 *.db
+*.db.tmp
+backups/
 leads_export*.csv
+leads_export*.xlsx
 *.log
 
 # Ambientes e caches Python

@@ -223,9 +223,10 @@ def test_fetch_html_connects_to_validated_ip_with_host_and_tls_sni(monkeypatch):
     assert captured["closed"] is True
 
 
-def test_production_auth_protects_pages_but_not_health(monkeypatch):
+def test_production_auth_protects_pages_but_not_health(monkeypatch, tmp_path):
     monkeypatch.setenv("APP_USERNAME", "ensino")
     monkeypatch.setenv("APP_PASSWORD", "senha-forte")
+    monkeypatch.setenv("LEADS_DB_PATH", str(tmp_path / "protected.db"))
     client = webapp.app.test_client()
 
     denied = client.get("/")
@@ -303,21 +304,23 @@ def test_home_explains_email_target_and_separate_lists(monkeypatch, tmp_path):
     assert "0 contato(s) sem e-mail, em lista separada" in html
 
 
-def test_home_loads_search_spinner_behavior(monkeypatch, tmp_path):
+def test_home_loads_search_progress_behavior(monkeypatch, tmp_path):
     monkeypatch.setenv("APP_PUBLIC_ACCESS", "1")
-    monkeypatch.setenv("LEADS_DB_PATH", str(tmp_path / "spinner.db"))
+    monkeypatch.setenv("LEADS_DB_PATH", str(tmp_path / "progress.db"))
     client = webapp.app.test_client()
 
     html = client.get("/").get_data(as_text=True)
-    script = client.get("/static/search.js")
+    script = client.get("/static/search-v2.js")
 
     assert 'id="search-form"' in html
-    assert 'id="search-spinner"' in html
-    assert 'src="/static/search.js"' in html
+    assert 'id="search-radar"' in html
+    assert 'id="search-progress"' in html
+    assert 'id="search-cancel"' in html
+    assert 'src="/static/search-v2.js"' in html
     assert script.status_code == 200
     javascript = script.get_data(as_text=True)
     assert 'addEventListener("submit"' in javascript
-    assert "spinner.hidden = false" in javascript
+    assert "AbortController" in javascript
     assert "button.disabled = true" in javascript
 
 

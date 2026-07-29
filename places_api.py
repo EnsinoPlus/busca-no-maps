@@ -12,6 +12,8 @@ do codigo (main.py / app.py usam place_id, name, formatted_address, etc).
 """
 import os
 import time
+from contextlib import contextmanager
+from contextvars import ContextVar
 
 import requests
 
@@ -34,6 +36,28 @@ API_KEY = os.environ.get("GOOGLE_MAPS_API_KEY")
 
 MAX_RETRIES = 3
 RETRY_BACKOFF = 2  # segundos (dobra a cada tentativa)
+_usage_recorder = ContextVar("places_usage_recorder", default=None)
+
+
+class UsageLimitError(RuntimeError):
+    """Interrompe a chamada antes de ultrapassar um limite reservado pelo cliente."""
+
+
+@contextmanager
+def usage_recorder(callback):
+    """Registra cada requisição HTTP real, inclusive retry, página e fallback."""
+    token = _usage_recorder.set(callback)
+    try:
+        yield
+    finally:
+        _usage_recorder.reset(token)
+
+
+def _record_request(url):
+    callback = _usage_recorder.get()
+    if callback:
+        endpoint = "text_search" if url in {NEW_TEXT_URL, LEGACY_TEXT_URL} else "place_details"
+        callback(endpoint)
 
 
 def _check_key():
@@ -49,6 +73,7 @@ def _get(url, params=None, headers=None, json_body=None, timeout=15):
     last_err = None
     for attempt in range(MAX_RETRIES):
         try:
+            _record_request(url)
             if json_body is not None:
                 resp = requests.post(url, headers=headers, json=json_body, timeout=timeout)
             else:

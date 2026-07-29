@@ -1,840 +1,458 @@
-"""
-Interface web local para o Leads Maps.
-
-Como rodar:
-    pip install flask
-    set GOOGLE_MAPS_API_KEY=sua_chave_aqui   (Windows)
-    python app.py
-
-Depois abra no navegador: http://127.0.0.1:5000
-"""
+"""Interface web PT-BR do Leads Maps v2."""
 import hmac
+import json
 import logging
 import os
 import secrets
+import sqlite3
 import tempfile
 import threading
 import time
 import urllib.parse
 from collections import defaultdict, deque
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
 from flask import (
     Flask,
     Response,
     abort,
     g,
-    jsonify,
     redirect,
     request,
     session,
+    stream_with_context,
     url_for,
 )
 from markupsafe import escape
 
 
 def _load_env():
-    """Carrega variáveis do arquivo .env (sem dependências externas)."""
     try:
-        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
-        with open(path, encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                key, value = line.split("=", 1)
-                key, value = key.strip(), value.strip().strip('"').strip("'")
-                os.environ.setdefault(key, value)
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"), encoding="utf-8") as handle:
+            for raw in handle:
+                line = raw.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    key, value = line.split("=", 1)
+                    os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
     except FileNotFoundError:
         pass
 
 
 _load_env()
-
-
 import database
 import email_finder
+import lead_quality
 import places_api
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("APP_SECRET_KEY") or secrets.token_hex(32)
-app.config["MAX_CONTENT_LENGTH"] = 64 * 1024
-app.config["SESSION_COOKIE_HTTPONLY"] = True
-app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+app.config.update(MAX_CONTENT_LENGTH=64 * 1024, SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE="Lax")
 app.config["SESSION_COOKIE_SECURE"] = os.environ.get("APP_SECURE_COOKIES") == "1"
 
 AUTH_FAILURE_LIMIT = 5
 SEARCH_RATE_LIMIT = 3
 RATE_LIMIT_WINDOW = 60
+MAX_SYNC_QUERIES = 2  # compatibilidade com POST legado
+MAX_SYNC_RESULTS_PER_QUERY = 5
+MAX_SEARCH_CANDIDATES = 60
+MAX_SEARCH_VARIATIONS = 3
+MAX_API_REQUESTS_PER_SEARCH = 30
+PAGE_SIZE = 25
 _rate_limit_events = defaultdict(deque)
 _rate_limit_lock = threading.Lock()
 _monotonic = time.monotonic
+log = logging.getLogger("leads_maps")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+CATEGORY_TRAD = {"lawyer": "Advocacia", "accounting": "Contabilidade", "finance": "Financeiro", "health": "Saúde", "doctor": "Médico", "real_estate_agency": "Imobiliária", "restaurant": "Restaurante", "store": "Loja", "establishment": "Estabelecimento"}
 
 
 def _rate_limit_allows(bucket, client_key, limit, window=RATE_LIMIT_WINDOW):
-    now = _monotonic()
-    key = (bucket, client_key)
+    now = _monotonic(); key = (bucket, client_key)
     with _rate_limit_lock:
-        events = _rate_limit_events[key]
-        cutoff = now - window
-        while events and events[0] <= cutoff:
-            events.popleft()
-        if len(events) >= limit:
-            return False
-        events.append(now)
-        return True
+        events = _rate_limit_events[key]; cutoff = now - window
+        while events and events[0] <= cutoff: events.popleft()
+        if len(events) >= limit: return False
+        events.append(now); return True
 
 
 def _reset_rate_limits():
-    """Limpa o limitador em memória (também torna os testes determinísticos)."""
-    with _rate_limit_lock:
-        _rate_limit_events.clear()
+    with _rate_limit_lock: _rate_limit_events.clear()
 
 
 def _is_production():
-    return (
-        os.environ.get("RENDER", "").lower() in {"1", "true", "yes"}
-        or os.environ.get("APP_ENV", "").lower() == "production"
-        or os.environ.get("FLASK_ENV", "").lower() == "production"
-    )
+    return os.environ.get("RENDER", "").lower() in {"1", "true", "yes"} or os.environ.get("APP_ENV", "").lower() == "production" or os.environ.get("FLASK_ENV", "").lower() == "production"
 
 
 @app.before_request
 def _require_auth():
-    """Protege produção, salvo quando o acesso público for explicitamente ativado."""
-    if request.endpoint == "health":
-        return None
-    if os.environ.get("APP_PUBLIC_ACCESS", "").lower() in {"1", "true", "yes"}:
-        return None
-    username = os.environ.get("APP_USERNAME")
-    password = os.environ.get("APP_PASSWORD")
-    secret_key = os.environ.get("APP_SECRET_KEY")
-    if _is_production() and (not username or not password or not secret_key):
-        return Response("Configuração de segurança incompleta.", status=503)
-    if not username and not password:
-        return None
-    if not username or not password:
-        return Response("Configuração de autenticação incompleta.", status=503)
+    if request.endpoint == "health" or os.environ.get("APP_PUBLIC_ACCESS", "").lower() in {"1", "true", "yes"}: return None
+    username, password, secret = os.environ.get("APP_USERNAME"), os.environ.get("APP_PASSWORD"), os.environ.get("APP_SECRET_KEY")
+    if _is_production() and (not username or not password or not secret): return Response("Configuração de segurança incompleta.", status=503)
+    if not username and not password: return None
+    if not username or not password: return Response("Configuração de autenticação incompleta.", status=503)
     auth = request.authorization
-    valid = bool(
-        auth
-        and hmac.compare_digest(auth.username or "", username)
-        and hmac.compare_digest(auth.password or "", password)
-    )
-    if not valid:
-        if not _rate_limit_allows("auth", request.remote_addr or "unknown", AUTH_FAILURE_LIMIT):
-            return Response(
-                "Muitas tentativas de autenticação.",
-                status=429,
-                headers={"Retry-After": "60"},
-            )
-        return Response(
-            "Autenticação necessária.",
-            status=401,
-            headers={"WWW-Authenticate": 'Basic realm="Leads Maps"'},
-        )
-    return None
+    valid = bool(auth and hmac.compare_digest(auth.username or "", username) and hmac.compare_digest(auth.password or "", password))
+    if valid: return None
+    if not _rate_limit_allows("auth", request.remote_addr or "unknown", AUTH_FAILURE_LIMIT): return Response("Muitas tentativas de autenticação.", status=429, headers={"Retry-After": "60"})
+    return Response("Autenticação necessária.", status=401, headers={"WWW-Authenticate": 'Basic realm="Leads Maps"'})
 
 
 @app.before_request
 def _limit_search_posts():
-    if (
-        request.endpoint == "buscar"
-        and request.method == "POST"
-        and not _rate_limit_allows("buscar", request.remote_addr or "unknown", SEARCH_RATE_LIMIT)
-    ):
-        return Response(
-            "Muitas buscas. Tente novamente em instantes.",
-            status=429,
-            headers={"Retry-After": "60"},
-        )
+    if request.endpoint == "buscar" and request.method == "POST" and not _rate_limit_allows("buscar", request.remote_addr or "unknown", SEARCH_RATE_LIMIT):
+        return Response("Muitas buscas. Tente novamente em instantes.", status=429, headers={"Retry-After": "60"})
     return None
 
 
 @app.before_request
 def _csrf_protect():
-    if request.method != "POST":
-        return
+    if request.method != "POST": return
     expected = session.get("csrf_token", "")
     received = request.form.get("csrf_token", "") or request.headers.get("X-CSRF-Token", "")
-    if not expected or not received or not hmac.compare_digest(expected, received):
-        abort(400, description="Token de segurança inválido ou ausente.")
+    if not expected or not received or not hmac.compare_digest(expected, received): abort(400, description="Token de segurança inválido ou ausente.")
     return
-
-
-def _csrf_token():
-    token = session.get("csrf_token")
-    if not token:
-        token = secrets.token_urlsafe(32)
-        session["csrf_token"] = token
-    return token
-
-
-def _csrf_input():
-    return f'<input type="hidden" name="csrf_token" value="{_csrf_token()}">'
 
 
 @app.after_request
 def _security_headers(response):
-    response.headers["Content-Security-Policy"] = (
-        "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; "
-        "object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'"
-    )
+    response.headers["Content-Security-Policy"] = "default-src 'self'; style-src 'self'; img-src 'self' data:; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'"
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["Referrer-Policy"] = "no-referrer"
     response.headers["Permissions-Policy"] = "geolocation=(), microphone=(), camera=()"
     return response
 
 
-@app.get("/health")
-def health():
-    return jsonify(status="ok")
+def _csrf_token():
+    if "csrf_token" not in session: session["csrf_token"] = secrets.token_urlsafe(32)
+    return session["csrf_token"]
+
+
+def _csrf_input():
+    return f'<input type="hidden" name="csrf_token" value="{_csrf_token()}">'
 
 
 def _get_db():
-    if "db" not in g:
-        g.db = database.get_connection()
+    if "db" not in g: g.db = database.get_connection()
     return g.db
 
 
 @app.teardown_appcontext
 def _close_db(_error=None):
     conn = g.pop("db", None)
-    if conn is not None:
-        conn.close()
+    if conn is not None: conn.close()
 
 
-# Log em arquivo + console
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
-    handlers=[
-        logging.FileHandler(os.path.join(os.path.dirname(os.path.abspath(__file__)), "leads.log"), encoding="utf-8"),
-        logging.StreamHandler(),
-    ],
-)
-log = logging.getLogger("leads_maps")
-
-PAGE_SIZE = 10
-MAX_SYNC_QUERIES = 2
-MAX_SYNC_RESULTS_PER_QUERY = 5
-MAX_SEARCH_CANDIDATES = 60
-
-CATEGORY_TRAD = {
-    "lawyer": "Advocacia",
-    "establishment": "Estabelecimento",
-    "point_of_interest": "Ponto de interesse",
-    "store": "Loja",
-    "restaurant": "Restaurante",
-    "accounting": "Contabilidade",
-    "finance": "Financeiro",
-    "health": "Saúde",
-    "doctor": "Médico",
-    "real_estate_agency": "Imobiliária",
-    "travel_agency": "Agência de viagem",
-    "insurance_agency": "Seguros",
-    "local_government_office": "Órgão público",
-}
-
-
-def _traduzir_categoria(types_str):
-    if not types_str:
-        return "-"
-    parts = [t.strip() for t in types_str.split(",") if t.strip()]
-    trads = []
-    for p in parts[:3]:
-        trads.append(CATEGORY_TRAD.get(p, p.replace("_", " ").title()))
-    return ", ".join(trads)
+@app.get("/health")
+def health():
+    return {"status": "ok"}
 
 
 def _checar_api_key():
-    if not os.environ.get("GOOGLE_MAPS_API_KEY"):
-        log.warning("GOOGLE_MAPS_API_KEY nao configurada!")
-        return False
-    return True
+    return bool(os.environ.get("GOOGLE_MAPS_API_KEY"))
 
 
-PAGE_STYLE = """
-<style>
-  :root {
-    --bg: #0b0d12;
-    --bg-soft: #11141b;
-    --card: #151922;
-    --card-hover: #1b2030;
-    --border: #232a39;
-    --border-soft: #1c2230;
-    --text: #e6e9ef;
-    --text-muted: #8b94a7;
-    --primary: #6366f1;
-    --primary-2: #8b5cf6;
-    --primary-soft: rgba(99,102,241,0.14);
-    --success: #34d399;
-    --success-bg: rgba(52,211,153,0.12);
-    --danger: #f87171;
-    --danger-bg: rgba(248,113,113,0.12);
-    --shadow: 0 10px 30px rgba(0,0,0,0.35);
-    --radius: 16px;
-  }
-  * { box-sizing: border-box; }
-  html, body { margin: 0; padding: 0; }
-  body {
-    font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif;
-    background:
-      radial-gradient(1200px 600px at 80% -10%, rgba(139,92,246,0.10), transparent 60%),
-      radial-gradient(900px 500px at -10% 10%, rgba(99,102,241,0.10), transparent 55%),
-      var(--bg);
-    color: var(--text);
-    min-height: 100vh;
-    -webkit-font-smoothing: antialiased;
-  }
-  .topbar {
-    display: flex; align-items: center; justify-content: space-between;
-    gap: 16px;
-    padding: 22px clamp(20px, 5vw, 56px);
-    border-bottom: 1px solid var(--border-soft);
-    background: rgba(11,13,18,0.7);
-    backdrop-filter: blur(10px);
-    position: sticky; top: 0; z-index: 10;
-  }
-  .brand { display: flex; align-items: center; gap: 12px; }
-  .brand .logo {
-    width: 38px; height: 38px; border-radius: 11px;
-    background: linear-gradient(135deg, var(--primary), var(--primary-2));
-    display: grid; place-items: center; font-size: 19px;
-    box-shadow: 0 6px 18px rgba(99,102,241,0.45);
-  }
-  .brand h1 { margin: 0; font-size: 17px; font-weight: 700; letter-spacing: -0.01em; }
-  .brand p { margin: 2px 0 0; font-size: 12.5px; color: var(--text-muted); }
-  .nav { display: flex; gap: 10px; flex-wrap: wrap; }
-  .nav a {
-    color: var(--text-muted); text-decoration: none; font-size: 13px; font-weight: 600;
-    padding: 9px 14px; border-radius: 10px; border: 1px solid var(--border-soft);
-    transition: all .15s ease;
-  }
-  .nav a:hover { color: var(--text); border-color: var(--border); background: var(--card); }
-  .wrap { max-width: 1120px; margin: 0 auto; padding: 32px clamp(20px, 5vw, 56px) 64px; }
-  .card {
-    background: linear-gradient(180deg, var(--card), var(--bg-soft));
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
-    padding: 26px;
-    box-shadow: var(--shadow);
-    margin-bottom: 22px;
-  }
-  .stat {
-    display: inline-flex; align-items: center; gap: 9px;
-    background: var(--primary-soft); color: #c7c9ff;
-    padding: 8px 15px; border-radius: 999px; font-size: 13px; font-weight: 600;
-    border: 1px solid rgba(99,102,241,0.25);
-  }
-  .section-title { font-size: 14px; font-weight: 700; margin: 0 0 14px; color: var(--text); }
-  label { display: block; font-weight: 600; font-size: 13px; margin: 18px 0 7px; color: var(--text-muted); }
-  textarea, input[type=number], input[type=text], select {
-    width: 100%; padding: 13px 15px;
-    border: 1px solid var(--border); border-radius: 12px;
-    font-size: 14px; font-family: inherit; color: var(--text);
-    background: var(--bg); transition: border-color .15s, box-shadow .15s;
-    resize: vertical;
-  }
-  textarea::placeholder, input::placeholder { color: #5b6478; }
-  textarea:focus, input:focus, select:focus {
-    outline: none; border-color: var(--primary);
-    box-shadow: 0 0 0 3px var(--primary-soft); background: var(--bg-soft);
-  }
-  .check {
-    display: flex; align-items: center; gap: 10px; margin-top: 18px;
-    font-size: 13.5px; color: var(--text); cursor: pointer; user-select: none;
-  }
-  .check input { width: 18px; height: 18px; accent-color: var(--primary); cursor: pointer; }
-  .btn {
-    display: inline-flex; align-items: center; gap: 8px;
-    background: linear-gradient(135deg, var(--primary), var(--primary-2));
-    color: white; border: none; padding: 12px 22px;
-    border-radius: 12px; font-size: 14px; font-weight: 600;
-    cursor: pointer; text-decoration: none; margin-top: 20px;
-    box-shadow: 0 8px 20px rgba(99,102,241,0.35);
-    transition: transform .12s ease, box-shadow .15s ease, filter .15s ease;
-  }
-  .btn:hover { transform: translateY(-1px); filter: brightness(1.06); box-shadow: 0 12px 26px rgba(99,102,241,0.45); }
-  .btn:active { transform: translateY(0) scale(0.99); }
-  .btn:disabled { cursor: wait; opacity: 0.75; transform: none; }
-  .spinner {
-    width: 17px; height: 17px; border-radius: 50%;
-    border: 2px solid rgba(255,255,255,0.35); border-top-color: #fff;
-    animation: spinner-rotate .75s linear infinite;
-  }
-  .spinner[hidden] { display: none; }
-  @keyframes spinner-rotate { to { transform: rotate(360deg); } }
-  .btn-secondary {
-    background: var(--card); color: var(--text);
-    border: 1px solid var(--border); box-shadow: none;
-  }
-  .btn-secondary:hover { background: var(--card-hover); filter: none; }
-  .btn-success {
-    background: linear-gradient(135deg, #10b981, #34d399);
-    box-shadow: 0 8px 20px rgba(16,185,129,0.3);
-  }
-  .btn-danger {
-    background: linear-gradient(135deg, #ef4444, #f87171);
-    box-shadow: 0 8px 20px rgba(239,68,68,0.3);
-  }
-  .btn-row { display: flex; gap: 12px; flex-wrap: wrap; }
-  table {
-    width: 100%; border-collapse: separate; border-spacing: 0;
-    font-size: 13px; overflow: hidden; border-radius: 12px;
-    border: 1px solid var(--border);
-  }
-  th {
-    background: var(--bg-soft); color: var(--text-muted);
-    text-transform: uppercase; font-size: 10.5px; font-weight: 700;
-    letter-spacing: 0.06em; text-align: left; padding: 13px 14px;
-    border-bottom: 1px solid var(--border);
-  }
-  td {
-    padding: 13px 14px; border-bottom: 1px solid var(--border-soft);
-    vertical-align: top; color: var(--text);
-  }
-  tbody tr { transition: background .12s ease; }
-  tbody tr:hover td { background: var(--card-hover); }
-  tbody tr:last-child td { border-bottom: none; }
-  .badge {
-    display: inline-block; padding: 4px 11px; border-radius: 999px;
-    font-size: 12px; font-weight: 600; max-width: 240px;
-    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; vertical-align: middle;
-  }
-  .badge-yes { background: var(--success-bg); color: var(--success); }
-  .badge-no { background: var(--danger-bg); color: var(--danger); }
-  .badge-sug { background: rgba(250,204,21,0.12); color: #facc15; }
-  .site-link { color: #a5b4fc; text-decoration: none; font-weight: 600; }
-  .site-link:hover { text-decoration: underline; }
-  .log-box {
-    background: #06080d; color: #cdd3e0;
-    padding: 18px 20px; border-radius: 12px;
-    border: 1px solid var(--border-soft);
-    font-family: 'JetBrains Mono', 'Consolas', monospace;
-    font-size: 12.5px; line-height: 1.75; white-space: pre-wrap;
-  }
-  .empty {
-    text-align: center; padding: 48px 20px; color: var(--text-muted);
-    border: 1px dashed var(--border); border-radius: 12px;
-  }
-  .empty strong { color: var(--text); }
-  .pager { display: flex; gap: 10px; align-items: center; justify-content: center; margin-top: 14px; flex-wrap: wrap; }
-  .pager a, .pager span { padding: 8px 14px; border-radius: 10px; border: 1px solid var(--border); color: var(--text-muted); text-decoration: none; font-size: 13px; }
-  .pager a:hover { color: var(--text); background: var(--card); }
-  .pager .current { color: var(--text); background: var(--card); border-color: var(--primary); }
-  .warn {
-    background: var(--danger-bg); color: var(--danger); border: 1px solid rgba(248,113,113,0.3);
-    padding: 12px 16px; border-radius: 12px; font-size: 13px; margin-bottom: 18px;
-  }
-  @media (max-width: 640px) {
-    .topbar { flex-direction: column; align-items: flex-start; }
-    .table-scroll { overflow-x: auto; }
-  }
-</style>
-"""
-
-
-def render_page(title, subtitle, body):
-    key_ok = bool(os.environ.get("GOOGLE_MAPS_API_KEY"))
-    warn = "" if key_ok else '<div class="warn">⚠️ GOOGLE_MAPS_API_KEY não configurada. As buscas vão falhar. Ajuste o arquivo .env.</div>'
-    return f"""
-    <!DOCTYPE html>
-    <html lang="pt-br">
-    <head>
-      <meta charset="UTF-8">
-      <meta name="viewport" content="width=device-width, initial-scale=1">
-      <title>Leads Maps</title>
-      {PAGE_STYLE}
-    </head>
-    <body>
-      <header class="topbar">
-        <div class="brand">
-          <div class="logo">🔎</div>
-          <div>
-            <h1>Leads Maps</h1>
-            <p>{escape(subtitle)}</p>
-          </div>
-        </div>
-        <nav class="nav">
-          <a href="/">Buscar</a>
-          <a href="/leads">Leads</a>
-          <a href="/exportar">Exportar</a>
-        </nav>
-      </header>
-      <div class="wrap">{warn}{body}</div>
-    </body>
-    </html>
-    """
+def _traduzir_categoria(types_str):
+    parts = [part.strip() for part in (types_str or "").split(",") if part.strip()]
+    return ", ".join(CATEGORY_TRAD.get(part, part.replace("_", " ").title()) for part in parts[:3]) or "-"
 
 
 def _safe_http_url(value):
-    if not value:
-        return None
-    try:
-        parsed = urllib.parse.urlsplit(str(value))
-    except ValueError:
-        return None
-    if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
-        return None
-    return str(value)
+    try: parsed = urllib.parse.urlsplit(str(value or ""))
+    except ValueError: return None
+    return str(value) if parsed.scheme.lower() in {"http", "https"} and parsed.hostname else None
+
+
+def render_page(title, subtitle, body):
+    warning = "" if _checar_api_key() else '<div class="warn">GOOGLE_MAPS_API_KEY não configurada. As buscas não funcionarão.</div>'
+    return f'''<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{escape(title)} · Leads Maps</title><link rel="stylesheet" href="/static/app.css"></head><body><header class="topbar"><a class="brand" href="/">Leads Maps <small>{escape(subtitle)}</small></a><nav><a href="/">Buscar</a><a href="/leads">Leads</a><a href="/exportar">Exportar</a><a href="/dashboard">Uso da API</a><a href="/backups">Backups</a></nav></header><main class="wrap">{warning}{body}</main></body></html>'''
 
 
 def _render_tabela(rows):
-    if not rows:
-        return '<div class="empty">Nenhum lead neste grupo.</div>'
-    table_rows = ""
+    if not rows: return '<div class="empty">Nenhum lead neste grupo.</div>'
+    output = []
     for row in rows:
-        if len(row) not in (8, 9):
-            raise ValueError("Cada linha deve ter 8 ou 9 colunas.")
+        if len(row) not in (8, 9): raise ValueError("Cada linha deve ter 8 ou 9 colunas.")
         name, address, phone, email, website, category, rating, search_query = row[:8]
-        email_sugerido = row[8] if len(row) == 9 else None
-        if email:
-            email_badge = f'<span class="badge badge-yes">{escape(email)}</span>'
-        elif email_sugerido:
-            email_badge = f'<span class="badge badge-sug">sugerido: {escape(email_sugerido)}</span>'
-        else:
-            email_badge = '<span class="badge badge-no">sem e-mail</span>'
-        website_safe = _safe_http_url(website)
-        website_link = (
-            f'<a class="site-link" href="{escape(website_safe)}" target="_blank" '
-            'rel="noopener noreferrer">site ↗</a>'
-            if website_safe else "-"
-        )
-        cat = _traduzir_categoria(category)
-        table_rows += f"""
-        <tr>
-          <td><b>{escape(name or '-')}</b></td>
-          <td>{escape(address or '-')}</td>
-          <td>{escape(phone or '-')}</td>
-          <td>{email_badge}</td>
-          <td>{website_link}</td>
-          <td>{escape(cat)}</td>
-          <td>{escape(rating or '-')}</td>
-          <td>{escape(search_query or '-')}</td>
-        </tr>
-        """
-    return f"""
-    <div class="table-scroll">
-    <table>
-      <thead><tr><th>Nome</th><th>Endereço</th><th>Telefone</th><th>E-mail</th><th>Site</th><th>Categoria</th><th>Nota</th><th>Busca</th></tr></thead>
-      <tbody>{table_rows}</tbody>
-    </table>
-    </div>
-    """
+        suggested = row[8] if len(row) == 9 else None
+        if email: email_html = f'<span class="badge good">{escape(email)}</span>'
+        elif suggested: email_html = f'<span class="badge medium">sugerido: {escape(suggested)}</span>'
+        else: email_html = '<span class="badge bad">sem e-mail</span>'
+        site = _safe_http_url(website)
+        site_html = f'<a href="{escape(site)}" target="_blank" rel="noopener noreferrer">site ↗</a>' if site else "-"
+        output.append(f"<tr><td><b>{escape(name or '-')}</b></td><td>{escape(address or '-')}</td><td>{escape(phone or '-')}</td><td>{email_html}</td><td>{site_html}</td><td>{escape(_traduzir_categoria(category))}</td><td>{escape(rating or '-')}</td><td>{escape(search_query or '-')}</td></tr>")
+    return '<div class="table-scroll"><table><thead><tr><th>Nome</th><th>Endereço</th><th>Telefone</th><th>E-mail</th><th>Site</th><th>Segmento</th><th>Nota</th><th>Busca</th></tr></thead><tbody>' + "".join(output) + "</tbody></table></div>"
 
 
-def _paginar(rows, pagina, size=PAGE_SIZE):
-    total_pages = max(1, (len(rows) + size - 1) // size)
-    pagina = max(1, min(pagina, total_pages))
-    start = (pagina - 1) * size
-    return rows[start:start + size], pagina, total_pages
-
-
-def _pager_html(pagina, total_pages, base_args):
-    if total_pages <= 1:
-        return ""
-    parts = []
-    if pagina > 1:
-        parts.append(f'<a href="?{base_args}&pagina={pagina-1}">← Anterior</a>')
-    parts.append(f'<span class="current">Página {pagina} de {total_pages}</span>')
-    if pagina < total_pages:
-        parts.append(f'<a href="?{base_args}&pagina={pagina+1}">Próxima →</a>')
-    return f'<div class="pager">{"".join(parts)}</div>'
-
-
-@app.route("/")
+@app.get("/")
 def home():
     conn = _get_db()
-    com_email = database.count_leads(conn, filtro="com_email")
-    sem_email = database.count_leads(conn, filtro="sem_email")
-    body = f"""
-    <div class="card">
-      <div class="stat">✉️ {com_email} contato(s) com e-mail</div>
-      <div class="stat">🚫 {sem_email} contato(s) sem e-mail, em lista separada</div>
-      <p style="color:var(--text-muted); font-size:13px; margin-top:16px;">
-        Encontre negócios no Google Maps e capture telefone, site e e-mail de contato.
-      </p>
-      <form id="search-form" method="POST" action="/buscar">
-        {_csrf_input()}
-        <label>Termos de busca (um por linha)</label>
-        <textarea name="queries" rows="4" placeholder="advogado trabalhista Mossoro RN&#10;contador Mossoro RN" required></textarea>
-
-        <label>Limite de resultados por termo (opcional)</label>
-        <input type="number" name="limit" min="1" max="{MAX_SYNC_RESULTS_PER_QUERY}" placeholder="ex: 5">
-
-        <p style="color:var(--text-muted); font-size:13px; margin-top:16px;">
-          A quantidade solicitada conta somente contatos com e-mail. Contatos sem e-mail ficam separados mais abaixo na lista.
-        </p>
-
-        <button id="search-button" class="btn" type="submit">
-          <span id="search-spinner" class="spinner" hidden aria-hidden="true"></span>
-          <span id="search-button-label">🔎 Buscar leads</span>
-        </button>
-      </form>
-    </div>
-
-    <div class="btn-row">
-      <a class="btn btn-secondary" href="/leads">📋 Ver leads salvos</a>
-    </div>
-    <script src="/static/search.js" defer></script>
-    """
-    return render_page("Leads Maps", "Prospecção via Google Maps", body)
+    try:
+        database.maybe_daily_backup(conn)
+    except (OSError, sqlite3.Error, AttributeError) as error:
+        log.warning("Backup diário não pôde ser criado: %s", error)
+    with_email = database.count_leads(conn, "com_email"); without_email = database.count_leads(conn, "sem_email")
+    body = f'''<section class="hero"><div><span class="eyebrow">Prospecção inteligente</span><h1>Encontre leads reais, sem contar duplicados.</h1><p>A quantidade solicitada conta somente contatos com e-mail. Contatos sem e-mail ficam separados mais abaixo na lista. O alvo considera apenas leads novos ou aprimorados com e-mail real.</p></div><div class="stats">{with_email} contato(s) com e-mail · {without_email} contato(s) sem e-mail, em lista separada</div></section><section class="card search-card"><form id="search-form" method="post" action="/buscar">{_csrf_input()}<div class="grid"><label>Segmento<input name="segment" maxlength="100" placeholder="Ex.: advocacia" required></label><label>Cidade<input name="city" maxlength="100" placeholder="Ex.: Mossoró" required></label><label>UF<input name="uf" maxlength="2" pattern="[A-Za-z]{{2}}" placeholder="RN" required></label><label>Localização específica<input name="location" maxlength="120" placeholder="Bairro, avenida ou região"></label></div><label>Quantidade de novos leads com e-mail<input type="number" name="limit" min="1" max="{MAX_SYNC_RESULTS_PER_QUERY}" value="5" required></label><button id="search-button" class="btn" type="submit">Iniciar varredura</button></form><section id="search-panel" class="progress-panel" hidden aria-live="polite"><div id="search-radar" class="radar"><i></i></div><div class="progress-content"><b id="search-phase">Preparando...</b><progress id="search-progress" max="100" value="0"></progress><div class="counters"><span><b id="count-scanned">0</b> analisados</span><span><b id="count-found">0</b> novos e-mails</span><span><b id="count-api">0</b> chamadas API</span></div><button id="search-cancel" class="btn secondary" type="button">Cancelar busca</button><pre id="search-log"></pre></div></section></section><script src="/static/search-v2.js" defer></script>'''
+    return render_page("Buscar", "prospecção v2", body)
 
 
-@app.route("/buscar", methods=["POST"])
+def _parse_search_form():
+    segment = request.form.get("segment", "").strip()
+    city = request.form.get("city", "").strip()
+    uf = request.form.get("uf", "").strip().upper()
+    location = request.form.get("location", "").strip()
+    legacy = [q.strip() for q in request.form.get("queries", "").splitlines() if q.strip()]
+    if legacy:
+        if len(legacy) > MAX_SYNC_QUERIES or any(len(q) > 200 for q in legacy): abort(400, description=f"Informe de 1 a {MAX_SYNC_QUERIES} termos, com até 200 caracteres cada.")
+        variations = legacy
+    else:
+        if not segment or not city or not re_fullmatch_uf(uf) or max(map(len, (segment, city, location)), default=0) > 120: abort(400, description="Informe segmento, cidade e uma UF válida.")
+        place = ", ".join(value for value in (location, city, uf) if value)
+        variations = [f"{segment} em {place}", f"{segment} {city} {uf}", f"melhores {segment} em {city} {uf}"][:MAX_SEARCH_VARIATIONS]
+    raw = request.form.get("limit", "").strip()
+    try: target = int(raw) if raw else MAX_SYNC_RESULTS_PER_QUERY
+    except ValueError: abort(400, description="O limite precisa ser um número inteiro.")
+    if not 1 <= target <= MAX_SYNC_RESULTS_PER_QUERY: abort(400, description=f"O limite deve estar entre 1 e {MAX_SYNC_RESULTS_PER_QUERY}.")
+    return segment, city, uf, variations, target
+
+
+def re_fullmatch_uf(value):
+    import re
+    return bool(re.fullmatch(r"[A-Z]{2}", value))
+
+
+def _env_float(name, default):
+    try: return max(0.0, float(os.environ.get(name, default)))
+    except ValueError: return default
+
+
+def _env_int(name, default, minimum=1, maximum=None):
+    try: value = int(os.environ.get(name, default))
+    except ValueError: value = default
+    value = max(minimum, value)
+    return min(value, maximum) if maximum is not None else value
+
+
+def _search_events(segment, city, uf, variations, target):
+    conn = database.get_connection(); seen = set(); new_email = scanned = api_calls = no_email = 0
+    hard_cap = _env_int("API_MAX_REQUESTS_PER_SEARCH", MAX_API_REQUESTS_PER_SEARCH, maximum=MAX_API_REQUESTS_PER_SEARCH)
+    ceiling = _env_int("API_DAILY_REQUEST_CEILING", 100)
+
+    def reserve_google_request(endpoint):
+        nonlocal api_calls
+        if api_calls >= hard_cap:
+            raise places_api.UsageLimitError("Teto desta busca atingido.")
+        rate_name = "GOOGLE_PLACES_TEXT_SEARCH_RATE" if endpoint == "text_search" else "GOOGLE_PLACES_DETAILS_RATE"
+        if not database.record_api_call(conn, endpoint, rate=_env_float(rate_name, 0.0), ceiling=ceiling):
+            raise places_api.UsageLimitError("Teto diário de requisições atingido.")
+        api_calls += 1
+
+    try:
+        yield {"phase": "planejando", "message": f"{len(variations)} variação(ões) de busca", "scanned": 0, "new_email_leads": 0, "api_calls": 0, "progress": 2}
+        per_variation_limit = MAX_SEARCH_CANDIDATES if len(variations) == 1 else max(1, MAX_SEARCH_CANDIDATES // len(variations))
+        for variation in variations:
+            if new_email >= target or api_calls >= hard_cap: break
+            try:
+                with places_api.usage_recorder(reserve_google_request):
+                    candidates = places_api.text_search(variation, max_results=per_variation_limit)
+            except places_api.UsageLimitError as error:
+                yield {"phase": "limite_api", "message": str(error), "scanned": scanned, "new_email_leads": new_email, "api_calls": api_calls, "progress": 100}; return
+            except RuntimeError as error:
+                yield {"phase": "erro", "message": str(error), "scanned": scanned, "new_email_leads": new_email, "api_calls": api_calls, "progress": min(95, scanned * 100 // max(1, target * 4))}; continue
+            for candidate in candidates:
+                if new_email >= target or api_calls >= hard_cap: break
+                place_id = candidate.get("place_id")
+                if not place_id or place_id in seen: continue
+                seen.add(place_id)
+                try:
+                    with places_api.usage_recorder(reserve_google_request):
+                        details = places_api.place_details(place_id) or {}
+                except places_api.UsageLimitError as error:
+                    yield {"phase": "limite_api", "message": str(error), "scanned": scanned, "new_email_leads": new_email, "api_calls": api_calls, "progress": 100}; return
+                except RuntimeError as error:
+                    yield {"phase": "erro_detalhes", "message": f"Falha ao analisar {place_id}: {error}", "scanned": scanned, "new_email_leads": new_email, "api_calls": api_calls, "progress": min(95, scanned * 100 // max(1, target * 4))}
+                    continue
+                scanned += 1
+                website = details.get("website"); phone = details.get("formatted_phone_number")
+                if website:
+                    database.record_api_call(conn, "website_check")
+                email, source, suggested = email_finder.find_email(website) if website else (None, None, None)
+                quality = lead_quality.assess_email(email, source, website) if email else {"quality": None, "confidence": None, "domain_aligned": False, "mx_valid": None}
+                data = {"place_id": place_id, "name": details.get("name") or candidate.get("name"), "address": details.get("formatted_address") or candidate.get("formatted_address"), "phone": phone, "email": email, "email_fonte": source, "email_sugerido": suggested, "website": website, "category": ", ".join(candidate.get("types", [])[:3]), "rating": details.get("rating") or candidate.get("rating"), "ratings_total": details.get("user_ratings_total") or candidate.get("user_ratings_total"), "latitude": candidate.get("geometry", {}).get("location", {}).get("lat"), "longitude": candidate.get("geometry", {}).get("location", {}).get("lng"), "search_query": variation, "created_at": datetime.now(timezone.utc).isoformat(), "segment": segment, "city": city, "uf": uf, "email_quality": quality["quality"], "email_confidence": quality["confidence"], "email_domain_aligned": int(quality["domain_aligned"]), "email_mx_valid": None if quality["mx_valid"] is None else int(quality["mx_valid"])}
+                outcome = database.upsert_lead(conn, data)
+                counts = bool(email) and (outcome["is_new"] or outcome["gained_email"])
+                if counts: new_email += 1
+                elif not email: no_email += 1
+                yield {"phase": "analisando", "message": f"{data['name'] or place_id}: {'e-mail confirmado' if counts else 'já existente' if email else 'sem e-mail'}", "scanned": scanned, "new_email_leads": new_email, "without_email": no_email, "api_calls": api_calls, "progress": min(98, int(new_email / target * 100))}
+        yield {"phase": "concluida", "message": f"{new_email} de {target} contato(s) com e-mail encontrado(s). {no_email} contato(s) sem e-mail listado(s) separadamente.", "scanned": scanned, "new_email_leads": new_email, "without_email": no_email, "api_calls": api_calls, "progress": 100}
+    finally: conn.close()
+
+
+@app.post("/buscar")
 def buscar():
-    queries = [q.strip() for q in request.form.get("queries", "").splitlines() if q.strip()]
-    limit_raw = request.form.get("limit", "").strip()
-    if not queries or len(queries) > MAX_SYNC_QUERIES or any(len(query) > 200 for query in queries):
-        abort(400, description=f"Informe de 1 a {MAX_SYNC_QUERIES} termos, com até 200 caracteres cada.")
-    try:
-        limit = int(limit_raw) if limit_raw else MAX_SYNC_RESULTS_PER_QUERY
-    except ValueError:
-        abort(400, description="O limite precisa ser um número inteiro.")
-    if not 1 <= limit <= MAX_SYNC_RESULTS_PER_QUERY:
-        abort(400, description=f"O limite deve estar entre 1 e {MAX_SYNC_RESULTS_PER_QUERY}.")
-    conn = _get_db()
-    log_lines = []
-    _checar_api_key()
+    segment, city, uf, variations, target = _parse_search_form()
+    events = _search_events(segment, city, uf, variations, target)
+    if "application/x-ndjson" in request.headers.get("Accept", ""):
+        @stream_with_context
+        def generate():
+            for event in events: yield json.dumps(event, ensure_ascii=False) + "\n"
+        return Response(generate(), mimetype="application/x-ndjson", headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"})
+    completed = list(events); final = completed[-1]
+    log_html = escape("\n".join(event["message"] for event in completed))
+    return render_page("Resultado", "busca concluída", f'<section class="card"><h1>Busca concluída</h1><p>{escape(final["message"])}</p><pre>{log_html}</pre><a class="btn" href="/leads">Ver leads salvos</a></section>')
 
-    for query in queries:
-        log_lines.append(f"🔎 Buscando: {query}")
+
+def _filter_args():
+    keys = ("email", "quality", "phone", "site", "rating_min", "segment", "city", "uf", "status", "exported", "date_from", "date_to", "followup", "busca")
+    filters = {key: request.args.get(key, "").strip() for key in keys if request.args.get(key, "").strip()}
+    return _validate_filter_values(filters)
+
+
+def _validate_filter_values(filters):
+    choices = {
+        "email": {"com_email", "sem_email"},
+        "quality": {"alta", "media", "baixa"},
+        "phone": {"sim", "nao"}, "site": {"sim", "nao"},
+        "status": set(database.FUNNEL_STATUSES), "exported": {"sim", "nao"},
+        "followup": {"atrasado", "agendado"},
+    }
+    for key, allowed in choices.items():
+        if filters.get(key) and filters[key] not in allowed:
+            abort(400, description=f"Filtro {key} inválido.")
+    if filters.get("rating_min"):
         try:
-            results = places_api.text_search(query, max_results=MAX_SEARCH_CANDIDATES)
-        except RuntimeError as e:
-            log_lines.append(f"  ⚠ Erro: {e}")
-            log.error("Erro na busca '%s': %s", query, e)
-            continue
-
-        com_email_salvos = 0
-        sem_email_salvos = 0
-        for r in results:
-            if com_email_salvos >= limit:
-                break
-            place_id = r.get("place_id")
-            if not place_id:
-                continue
-
-            details = places_api.place_details(place_id)
-            website = details.get("website")
-            phone = details.get("formatted_phone_number")
-            email, email_fonte, email_sugerido = email_finder.find_email(website) if website else (None, None, None)
-
-            lead = {
-                "place_id": place_id,
-                "name": details.get("name") or r.get("name"),
-                "address": details.get("formatted_address") or r.get("formatted_address"),
-                "phone": phone,
-                "email": email,
-                "email_fonte": email_fonte,
-                "email_sugerido": email_sugerido,
-                "website": website,
-                "category": ", ".join(r.get("types", [])[:3]),
-                "rating": details.get("rating") or r.get("rating"),
-                "ratings_total": details.get("user_ratings_total") or r.get("user_ratings_total"),
-                "latitude": r.get("geometry", {}).get("location", {}).get("lat"),
-                "longitude": r.get("geometry", {}).get("location", {}).get("lng"),
-                "search_query": query,
-                "created_at": datetime.now(timezone.utc).isoformat(),
-            }
-            database.upsert_lead(conn, lead)
-            if email:
-                com_email_salvos += 1
-                log_lines.append(f"    ✔ {lead['name']}  |  📞 {phone or '-'}  |  ✉️ {email}")
-            else:
-                sem_email_salvos += 1
-
-        log_lines.append(
-            f"  → {com_email_salvos} de {limit} contato(s) com e-mail encontrado(s)."
-        )
-        log_lines.append(
-            f"  → {sem_email_salvos} contato(s) sem e-mail listado(s) separadamente."
-        )
-
-    log_html = escape("\n".join(log_lines))
-    body = f"""
-    <div class="card">
-      <h3 class="section-title">Log da busca</h3>
-      <div class="log-box">{log_html}</div>
-    </div>
-    <div class="btn-row">
-      <a class="btn" href="/leads">📋 Ver leads salvos</a>
-      <a class="btn btn-secondary" href="/">🔎 Nova busca</a>
-    </div>
-    """
-    return render_page("Resultado", "Busca concluída", body)
+            rating = float(filters["rating_min"])
+        except ValueError:
+            abort(400, description="A nota mínima precisa ser um número.")
+        if not 0 <= rating <= 5:
+            abort(400, description="A nota mínima deve estar entre 0 e 5.")
+    if filters.get("uf"):
+        filters["uf"] = filters["uf"].upper()
+        if not re_fullmatch_uf(filters["uf"]):
+            abort(400, description="UF inválida.")
+    for key in ("date_from", "date_to"):
+        if filters.get(key):
+            try: date.fromisoformat(filters[key])
+            except ValueError: abort(400, description=f"Data inválida em {key}.")
+    return filters
 
 
-@app.route("/leads")
+def _select(name, choices, selected):
+    options = ['<option value="">Todos</option>']
+    options += [f'<option value="{escape(value)}" {"selected" if value == selected else ""}>{escape(label)}</option>' for value, label in choices]
+    return f'<select name="{name}">' + "".join(options) + "</select>"
+
+
+def _crm_table(rows):
+    if not rows: return '<div class="empty">Nenhum lead encontrado.</div>'
+    items = []
+    status_options = [(status, status.replace("_", " ").title()) for status in database.FUNNEL_STATUSES]
+    for row in rows:
+        site = _safe_http_url(row["website"])
+        quality = row["email_quality"] or "-"
+        items.append(f'''<tr><td><input type="checkbox" name="ids" value="{escape(row['place_id'])}" form="export-selection"></td><td><b>{escape(row['name'] or '-')}</b><small>{escape(row['city'] or '')}/{escape(row['uf'] or '')}</small></td><td>{escape(row['email'] or 'sem e-mail')}<small>Qualidade: {escape(quality)} · {escape(row['email_confidence'] if row['email_confidence'] is not None else '-')}%</small></td><td>{escape(row['phone'] or '-')} · {f'<a href="{escape(site)}" target="_blank" rel="noopener noreferrer">site</a>' if site else '-'}</td><td><form method="post" action="/leads/{urllib.parse.quote(row['place_id'], safe='')}/editar">{_csrf_input()}{_select('status', status_options, row['status'])}<input name="assignee" value="{escape(row['assignee'] or '')}" placeholder="Responsável"><input name="tags" value="{escape(row['tags'] or '')}" placeholder="Tags"><textarea name="notes" placeholder="Notas">{escape(row['notes'] or '')}</textarea><label>Último contato<input type="datetime-local" name="last_contact_at" value="{escape((row['last_contact_at'] or '')[:16])}"></label><label>Próximo follow-up<input type="datetime-local" name="next_followup_at" value="{escape((row['next_followup_at'] or '')[:16])}"></label><button class="btn small" type="submit">Salvar</button></form></td></tr>''')
+    return '<div class="table-scroll"><table><thead><tr><th>Sel.</th><th>Lead</th><th>E-mail</th><th>Contato</th><th>Funil e acompanhamento</th></tr></thead><tbody>' + "".join(items) + "</tbody></table></div>"
+
+
+@app.get("/leads")
 def leads():
-    conn = _get_db()
-    filtro = request.args.get("filtro", "todos")
-    busca = request.args.get("busca", "").strip()
-    try:
-        pagina = int(request.args.get("pagina", "1"))
-    except ValueError:
-        pagina = 1
-
-    com = database.query_leads(conn, filtro="com_email", busca=busca)
-    sem = database.query_leads(conn, filtro="sem_email", busca=busca)
-    total = len(com) + len(sem)
-
-    # aplica filtro de e-mail na visualizacao
-    if filtro == "com_email":
-        sem = []
-    elif filtro == "sem_email":
-        com = []
-
-    com_p, pg_c, tot_c = _paginar(com, pagina)
-    sem_p, pg_s, tot_s = _paginar(sem, pagina)
-
-    base_args = urllib.parse.urlencode({"filtro": filtro, "busca": busca})
-    body = f"""
-    <div class="btn-row" style="margin-bottom:22px;">
-      <a class="btn btn-secondary" href="/">🔎 Nova busca</a>
-      <a class="btn btn-success" href="/exportar">⬇️ Exportar CSV (com filtros)</a>
-      <a class="btn btn-danger" href="/limpar">🗑️ Limpar banco</a>
-    </div>
-
-    <div class="card">
-      <form method="GET" action="/leads" style="display:flex; gap:12px; flex-wrap:wrap; align-items:flex-end;">
-        <div style="flex:1; min-width:200px;">
-          <label style="margin-top:0;">Filtrar por e-mail</label>
-          <select name="filtro">
-            <option value="todos" {'selected' if filtro=='todos' else ''}>Todos</option>
-            <option value="com_email" {'selected' if filtro=='com_email' else ''}>Só com e-mail</option>
-            <option value="sem_email" {'selected' if filtro=='sem_email' else ''}>Só sem e-mail</option>
-          </select>
-        </div>
-        <div style="flex:2; min-width:240px;">
-          <label style="margin-top:0;">Buscar por termo</label>
-          <input type="text" name="busca" value="{escape(busca)}" placeholder="ex: Mossoró, Fortaleza...">
-        </div>
-        <button class="btn" type="submit" style="margin-top:0;">🔍 Filtrar</button>
-      </form>
-    </div>
-    """
-
-    if com:
-        body += f"""
-        <div class="card">
-          <h3 class="section-title">✉️ Com e-mail <span class="stat" style="margin-left:8px;">{len(com)}</span></h3>
-          {_render_tabela(com_p)}
-          {_pager_html(pg_c, tot_c, base_args)}
-        </div>
-        """
-    if sem:
-        body += f"""
-        <div class="card">
-          <h3 class="section-title">🚫 Sem e-mail <span class="stat" style="margin-left:8px;">{len(sem)}</span></h3>
-          {_render_tabela(sem_p)}
-          {_pager_html(pg_s, tot_s, base_args)}
-        </div>
-        """
-    if not com and not sem:
-        body += '<div class="empty">Nenhum lead encontrado com esses filtros. <strong>Faça uma busca</strong> pra começar.</div>'
-
-    return render_page("Leads salvos", f"{total} lead(s) no total", body)
+    filters = _filter_args()
+    # Compatibilidade com o filtro antigo.
+    if request.args.get("filtro"): filters["email"] = request.args["filtro"]
+    rows = database.query_lead_records(_get_db(), filters)
+    email_choices = [("com_email", "Com e-mail"), ("sem_email", "Sem e-mail")]
+    quality_choices = [("alta", "Alta"), ("media", "Média"), ("baixa", "Baixa")]
+    bool_choices = [("sim", "Sim"), ("nao", "Não")]
+    status_choices = [(status, status.replace("_", " ").title()) for status in database.FUNNEL_STATUSES]
+    filter_hidden = "".join(f'<input type="hidden" name="{escape(key)}" value="{escape(value)}">' for key, value in filters.items())
+    body = f'''<section class="card"><h1>Leads</h1><form class="filters" method="get"><label>E-mail{_select('email', email_choices, filters.get('email'))}</label><label>Qualidade{_select('quality', quality_choices, filters.get('quality'))}</label><label>Telefone{_select('phone', bool_choices, filters.get('phone'))}</label><label>Site{_select('site', bool_choices, filters.get('site'))}</label><label>Nota mínima<input type="number" step="0.1" min="0" max="5" name="rating_min" value="{escape(filters.get('rating_min',''))}"></label><label>Segmento<input name="segment" value="{escape(filters.get('segment',''))}"></label><label>Cidade<input name="city" value="{escape(filters.get('city',''))}"></label><label>UF<input name="uf" maxlength="2" value="{escape(filters.get('uf',''))}"></label><label>Status{_select('status', status_choices, filters.get('status'))}</label><label>Exportado{_select('exported', bool_choices, filters.get('exported'))}</label><label>Desde<input type="date" name="date_from" value="{escape(filters.get('date_from',''))}"></label><label>Até<input type="date" name="date_to" value="{escape(filters.get('date_to',''))}"></label><label>Follow-up{_select('followup', [('atrasado','Atrasado'),('agendado','Agendado')], filters.get('followup'))}</label><label>Busca<input name="busca" value="{escape(filters.get('busca',''))}"></label><button class="btn" type="submit">Filtrar</button></form><form method="post" action="/exportar">{_csrf_input()}<input type="hidden" name="scope" value="filtered"><input type="hidden" name="format" value="xlsx">{filter_hidden}<button class="btn secondary" type="submit">Exportar filtro atual</button></form></section><section class="card"><form id="export-selection" method="post" action="/exportar"><input type="hidden" name="csrf_token" value="{_csrf_token()}"><input type="hidden" name="scope" value="selected"><button class="btn secondary" type="submit" name="format" value="xlsx">Exportar selecionados</button></form><p><b>{len(rows)}</b> resultado(s); os leads com e-mail aparecem primeiro.</p>{_crm_table(rows)}</section>'''
+    return render_page("Leads", f"{len(rows)} encontrados", body)
 
 
-@app.route("/exportar")
+@app.post("/leads/<path:place_id>/editar")
+def edit_lead(place_id):
+    fields = {key: request.form.get(key, "") for key in ("status", "notes", "assignee", "tags", "last_contact_at", "next_followup_at")}
+    try: updated = database.update_lead_crm(_get_db(), place_id, fields)
+    except ValueError as error: abort(400, description=str(error))
+    if not updated: abort(404)
+    return redirect(url_for("leads"))
+
+
+@app.get("/exportar")
 def exportar_pagina():
-    conn = _get_db()
-    total = database.count_leads(conn)
-    com = len(database.query_leads(conn, filtro="com_email"))
-    sem = len(database.query_leads(conn, filtro="sem_email"))
-    body = f"""
-    <div class="card">
-      <h3 class="section-title">⬇️ Exportar leads para CSV</h3>
-      <p style="color:var(--text-muted); font-size:13px; margin-top:0;">
-        {total} lead(s) no total — {com} com e-mail, {sem} sem e-mail.
-      </p>
-      <form method="GET" action="/exportar.csv">
-        <label>Filtrar por e-mail</label>
-        <select name="filtro">
-          <option value="todos">Todos os leads</option>
-          <option value="com_email">Só com e-mail</option>
-          <option value="sem_email">Só sem e-mail</option>
-        </select>
-
-        <label>Filtrar por termo de busca (opcional)</label>
-        <input type="text" name="busca" placeholder="ex: Mossoró, Fortaleza, advogado...">
-
-        <button class="btn" type="submit">⬇️ Baixar CSV filtrado</button>
-      </form>
-    </div>
-    <div class="btn-row">
-      <a class="btn btn-secondary" href="/leads">📋 Ver leads salvos</a>
-      <a class="btn btn-secondary" href="/">🔎 Nova busca</a>
-    </div>
-    """
-    return render_page("Exportar CSV", "Exporte com filtros", body)
+    body = f'''<section class="card"><h1>Exportar leads</h1><p>CSV seguro ou XLSX profissional. O download GET legado não altera o histórico.</p><form method="post" action="/exportar">{_csrf_input()}<label>Escopo<select name="scope"><option value="filtered">Todos filtrados</option><option value="unexported">Novos ainda não exportados</option></select></label><label>Formato<select name="format"><option value="xlsx">Excel XLSX</option><option value="csv">CSV UTF-8</option></select></label><button class="btn" type="submit">Gerar e marcar como exportado</button></form></section>'''
+    return render_page("Exportar", "arquivos seguros", body)
 
 
-@app.route("/exportar.csv")
+def _export_response(fmt, filters, mark=False):
+    conn = _get_db(); rows = database.query_lead_records(conn, filters); suffix = ".xlsx" if fmt == "xlsx" else ".csv"
+    with tempfile.NamedTemporaryFile(prefix="leads_export_", suffix=suffix, delete=False) as temporary: path = temporary.name
+    try:
+        if fmt == "xlsx": database.export_xlsx(conn, path, filters)
+        else:
+            if set(filters) <= {"filtro", "busca"}:
+                database.export_csv(conn, path, filtro=filters.get("filtro"), busca=filters.get("busca"))
+            else:
+                database.export_csv(conn, path, filters=filters)
+        if fmt == "csv":
+            with open(path, encoding="utf-8-sig") as handle: content = handle.read()
+        else:
+            with open(path, "rb") as handle: content = handle.read()
+    finally:
+        try: os.unlink(path)
+        except FileNotFoundError: pass
+    if mark: database.mark_exported(conn, [row["place_id"] for row in rows])
+    mime = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" if fmt == "xlsx" else "text/csv; charset=utf-8"
+    return Response(content, mimetype=mime, headers={"Content-Disposition": f"attachment; filename=leads_export{suffix}", "Cache-Control": "no-store"})
+
+
+@app.post("/exportar")
+def exportar_post():
+    fmt = request.form.get("format", "xlsx")
+    if fmt not in {"csv", "xlsx"}: abort(400)
+    scope = request.form.get("scope", "filtered")
+    filters = {key: request.form.get(key, "").strip() for key in ("email", "quality", "phone", "site", "rating_min", "segment", "city", "uf", "status", "exported", "date_from", "date_to", "followup", "busca") if request.form.get(key, "").strip()}
+    _validate_filter_values(filters)
+    if scope == "selected":
+        ids = request.form.getlist("ids")
+        if not ids: abort(400, description="Selecione ao menos um lead.")
+        filters["ids"] = ids
+    elif scope == "unexported": filters["exported"] = "nao"
+    elif scope != "filtered": abort(400)
+    return _export_response(fmt, filters, mark=True)
+
+
+@app.get("/exportar.csv")
 def exportar_csv():
     filtro = request.args.get("filtro", "todos")
-    busca = request.args.get("busca", "").strip()
-    if filtro not in ("todos", "com_email", "sem_email"):
-        filtro = "todos"
+    if filtro not in {"todos", "com_email", "sem_email"}: filtro = "todos"
+    return _export_response("csv", {"filtro": filtro, "busca": request.args.get("busca", "")}, mark=False)
 
-    conn = _get_db()
-    with tempfile.NamedTemporaryFile(prefix="leads_export_", suffix=".csv", delete=False) as temp_file:
-        path = temp_file.name
-    try:
-        database.export_csv(conn, filepath=path, filtro=filtro or None, busca=busca or None)
-        with open(path, "r", encoding="utf-8") as f:
-            content = f.read()
-    finally:
-        try:
-            os.unlink(path)
-        except FileNotFoundError:
-            pass
-    return Response(
-        content,
-        mimetype="text/csv",
-        headers={"Content-Disposition": f"attachment; filename=leads_export_{filtro}.csv"},
-    )
+
+@app.get("/dashboard")
+def dashboard():
+    usage = database.api_usage_summary(_get_db()); ceiling = _env_int("API_DAILY_REQUEST_CEILING", 100)
+    rows = "".join(f"<tr><td>{escape(row['endpoint'])}</td><td>{row['requests']}</td><td>{row['units']}</td><td>US$ {row['estimated_cost']:.4f} (estimado)</td></tr>" for row in usage["rows"])
+    body = f'''<section class="card"><h1>Uso diário da API</h1><div class="stats"><b>{usage['api_requests']}</b> / {ceiling} requisições Google · {usage['requests']} operações externas registradas · US$ {usage['estimated_cost']:.4f} estimado</div><progress max="{ceiling}" value="{usage['api_requests']}"></progress><p>Custos são estimativas calculadas com as tarifas configuradas; confira a cobrança real no Google Cloud.</p><table><thead><tr><th>Endpoint</th><th>Requisições</th><th>Unidades</th><th>Custo</th></tr></thead><tbody>{rows}</tbody></table></section>'''
+    return render_page("Uso da API", usage["day"], body)
+
+
+@app.route("/backups", methods=["GET", "POST"])
+def backups():
+    message = ""
+    if request.method == "POST":
+        path = database.create_backup(_get_db(), retention=30); message = f'<div class="success">Backup criado: {escape(os.path.basename(path))}</div>'
+    files = database.list_backups()
+    rows = "".join(f"<tr><td>{escape(item['filename'])}</td><td>{item['size_bytes']:,} bytes</td></tr>" for item in files)
+    body = f'''{message}<section class="card"><h1>Backups do banco</h1><p>Cópias SQLite online são armazenadas somente na pasta <code>backups/</code>, com retenção das 30 mais recentes.</p><form method="post">{_csrf_input()}<button class="btn" type="submit">Criar backup agora</button></form><table><thead><tr><th>Arquivo</th><th>Tamanho</th></tr></thead><tbody>{rows}</tbody></table></section>'''
+    return render_page("Backups", "retenção 30", body)
 
 
 @app.route("/limpar", methods=["GET", "POST"])
 def limpar():
-    if request.method == "POST":
-        confirm = request.form.get("confirm", "")
-        if confirm == "LIMPAR":
-            conn = _get_db()
-            database.apagar_todos(conn)
-            log.warning("Banco de leads apagado pelo usuario.")
-            return redirect(url_for("leads"))
-        body = '<div class="warn">Confirmação incorreta. Digite LIMPAR no campo abaixo.</div>' + _limpar_form()
-        return render_page("Limpar banco", "Confirme", body)
-    return render_page("Limpar banco", "Confirme a ação", _limpar_form())
-
-
-def _limpar_form():
-    return f"""
-    <div class="card">
-      <h3 class="section-title">🗑️ Apagar todos os leads</h3>
-      <p style="color:var(--text-muted); font-size:13px;">
-        Esta ação remove permanentemente todos os leads do banco local (leads.db).
-        Não pode ser desfeita.
-      </p>
-      <form method="POST" action="/limpar">
-        {_csrf_input()}
-        <label>Digite <b>LIMPAR</b> para confirmar</label>
-        <input type="text" name="confirm" placeholder="LIMPAR">
-        <button class="btn btn-danger" type="submit">Apagar tudo</button>
-      </form>
-    </div>
-    <div class="btn-row">
-      <a class="btn btn-secondary" href="/leads">← Voltar</a>
-    </div>
-    """
+    if request.method == "POST" and request.form.get("confirm") == "LIMPAR": database.apagar_todos(_get_db()); return redirect(url_for("leads"))
+    return render_page("Limpar", "ação irreversível", f'<section class="card"><h1>Limpar banco</h1><form method="post">{_csrf_input()}<label>Digite LIMPAR<input name="confirm"></label><button class="btn danger">Apagar tudo</button></form></section>')
 
 
 if __name__ == "__main__":
-    if not _checar_api_key():
-        print("\n⚠️  AVISO: GOOGLE_MAPS_API_KEY não configurada. As buscas vão falhar.\n")
-    print("\n🚀 Abra no navegador: http://127.0.0.1:5000\n")
     app.run(debug=False, port=5000)
