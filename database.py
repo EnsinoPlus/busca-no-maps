@@ -37,7 +37,8 @@ EXPECTED_COLUMNS = {
     "next_followup_at": "TEXT", "exported_at": "TEXT", "normalized_email": "TEXT",
     "normalized_phone": "TEXT", "normalized_domain": "TEXT",
     "normalized_name_address": "TEXT",
-    "brevo_contact_id": "TEXT", "brevo_list_id": "INTEGER", "brevo_synced_at": "TEXT",
+    "brevo_contact_id": "TEXT", "brevo_list_id": "INTEGER", "brevo_synced_email": "TEXT",
+    "brevo_synced_at": "TEXT",
     "brevo_last_attempt_at": "TEXT", "brevo_sync_error": "TEXT",
 }
 _SCHEMA_LOCK = threading.Lock()
@@ -278,7 +279,9 @@ def update_lead_crm(conn, place_id, fields):
     return cur.rowcount == 1
 
 
-def record_brevo_sync(conn, place_id, contact_id, list_id, error=None, attempted_at=None):
+def record_brevo_sync(
+    conn, place_id, contact_id, list_id, error=None, attempted_at=None, synced_email=None,
+):
     attempted_at = attempted_at or datetime.now(timezone.utc).isoformat()
     if error:
         cur = conn.execute(
@@ -286,10 +289,15 @@ def record_brevo_sync(conn, place_id, contact_id, list_id, error=None, attempted
             (attempted_at, str(error)[:500], place_id),
         )
     else:
+        normalized_synced_email = normalize_email(synced_email) if synced_email is not None else None
         cur = conn.execute(
-            "UPDATE leads SET brevo_contact_id=?,brevo_list_id=?,brevo_synced_at=?,"
+            "UPDATE leads SET brevo_contact_id=?,brevo_list_id=?,"
+            "brevo_synced_email=COALESCE(?,normalized_email),brevo_synced_at=?,"
             "brevo_last_attempt_at=?,brevo_sync_error=NULL WHERE place_id=?",
-            (str(contact_id) if contact_id is not None else None, int(list_id), attempted_at, attempted_at, place_id),
+            (
+                str(contact_id) if contact_id is not None else None,
+                int(list_id), normalized_synced_email, attempted_at, attempted_at, place_id,
+            ),
         )
     conn.commit()
     return cur.rowcount == 1

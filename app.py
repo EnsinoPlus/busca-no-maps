@@ -64,6 +64,7 @@ BREVO_UNLOCK_TTL_SECONDS = 15 * 60
 PAGE_SIZE = 25
 _rate_limit_events = defaultdict(deque)
 _rate_limit_lock = threading.Lock()
+_auto_brevo_sync_lock = threading.Lock()
 _monotonic = time.monotonic
 log = logging.getLogger("leads_maps")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -239,6 +240,7 @@ def _env_int(name, default, minimum=1, maximum=None):
 
 def _search_events(segment, city, uf, variations, target):
     conn = database.get_connection(); seen = set(); new_email = scanned = api_calls = no_email = 0
+    auto_brevo_blocked = False
     hard_cap = _env_int("API_MAX_REQUESTS_PER_SEARCH", MAX_API_REQUESTS_PER_SEARCH, maximum=MAX_API_REQUESTS_PER_SEARCH)
     ceiling = _env_int("API_DAILY_REQUEST_CEILING", 100)
 
@@ -287,10 +289,16 @@ def _search_events(segment, city, uf, variations, target):
                 quality = lead_quality.assess_email(email, source, website) if email else {"quality": None, "confidence": None, "domain_aligned": False, "mx_valid": None}
                 data = {"place_id": place_id, "name": details.get("name") or candidate.get("name"), "address": details.get("formatted_address") or candidate.get("formatted_address"), "phone": phone, "email": email, "email_fonte": source, "email_sugerido": suggested, "website": website, "category": ", ".join(candidate.get("types", [])[:3]), "rating": details.get("rating") or candidate.get("rating"), "ratings_total": details.get("user_ratings_total") or candidate.get("user_ratings_total"), "latitude": candidate.get("geometry", {}).get("location", {}).get("lat"), "longitude": candidate.get("geometry", {}).get("location", {}).get("lng"), "search_query": variation, "created_at": datetime.now(timezone.utc).isoformat(), "segment": segment, "city": city, "uf": uf, "email_quality": quality["quality"], "email_confidence": quality["confidence"], "email_domain_aligned": int(quality["domain_aligned"]), "email_mx_valid": None if quality["mx_valid"] is None else int(quality["mx_valid"])}
                 outcome = database.upsert_lead(conn, data)
+                auto_brevo_status = None
+                if email and not auto_brevo_blocked:
+                    auto_brevo_status = _attempt_auto_sync_brevo(conn, outcome["place_id"])
+                    if auto_brevo_status == "falha_sistemica":
+                        auto_brevo_blocked = True
                 counts = bool(email) and (outcome["is_new"] or outcome["gained_email"])
                 if counts: new_email += 1
                 elif not email: no_email += 1
-                yield {"phase": "analisando", "message": f"{data['name'] or place_id}: {'e-mail confirmado' if counts else 'já existente' if email else 'sem e-mail'}", "scanned": scanned, "new_email_leads": new_email, "without_email": no_email, "api_calls": api_calls, "progress": min(98, int(new_email / target * 100))}
+                brevo_suffix = " · salvo no Brevo" if auto_brevo_status == "sincronizado" else ""
+                yield {"phase": "analisando", "message": f"{data['name'] or place_id}: {'e-mail confirmado' if counts else 'já existente' if email else 'sem e-mail'}{brevo_suffix}", "scanned": scanned, "new_email_leads": new_email, "without_email": no_email, "api_calls": api_calls, "progress": min(98, int(new_email / target * 100))}
         yield {"phase": "concluida", "message": f"{new_email} de {target} contato(s) com e-mail encontrado(s). {no_email} contato(s) sem e-mail listado(s) separadamente.", "scanned": scanned, "new_email_leads": new_email, "without_email": no_email, "api_calls": api_calls, "progress": 100}
     finally: conn.close()
 
@@ -435,6 +443,82 @@ def _brevo_client():
     return brevo_api.BrevoClient(api_key)
 
 
+def _attempt_auto_sync_brevo(conn, place_id):
+    try:
+        return _auto_sync_brevo_lead(conn, place_id)
+    # Fronteira de isolamento: nenhuma falha Brevo pode interromper a busca principal.
+    except Exception:  # noqa: BLE001
+        log.error("Falha inesperada e sanitizada no armazenamento automático Brevo.")
+        return "falha_sistemica"
+
+
+def _auto_sync_brevo_lead(conn, place_id, client=None):
+    with _auto_brevo_sync_lock:
+        return _auto_sync_brevo_lead_locked(conn, place_id, client=client)
+
+
+def _auto_sync_brevo_lead_locked(conn, place_id, client=None):
+    if os.environ.get("BREVO_AUTO_SYNC", "").lower() not in {"1", "true", "yes"}:
+        return "desativado"
+    try:
+        list_id = int(os.environ.get("BREVO_AUTO_SYNC_LIST_ID", ""))
+    except (TypeError, ValueError):
+        return "desativado"
+    if list_id < 1:
+        return "desativado"
+    try:
+        min_confidence = int(os.environ.get("BREVO_AUTO_SYNC_MIN_CONFIDENCE", "80"))
+    except ValueError:
+        min_confidence = 80
+    min_confidence = max(0, min(100, min_confidence))
+    rows = database.query_lead_records(conn, {"ids": [place_id]})
+    if not rows:
+        return "ignorado"
+    row = rows[0]
+    relevant = bool(
+        brevo_api.is_valid_email(row["email"])
+        and row["email_quality"] == "alta"
+        and (row["email_confidence"] or 0) >= min_confidence
+        and row["email_domain_aligned"] == 1
+        and row["email_mx_valid"] == 1
+        and row["status"] != "descartado"
+    )
+    if not relevant:
+        return "ignorado"
+    if (
+        row["brevo_synced_at"]
+        and row["brevo_list_id"] == list_id
+        and row["brevo_synced_email"] == row["normalized_email"]
+    ):
+        return "ja_sincronizado"
+    if client is None:
+        api_key = os.environ.get("BREVO_API_KEY", "").strip()
+        if not api_key:
+            database.record_brevo_sync(
+                conn, row["place_id"], None, list_id,
+                error="Integração Brevo não configurada.",
+            )
+            return "falha_sistemica"
+        try:
+            timeout = float(os.environ.get("BREVO_AUTO_SYNC_TIMEOUT", "5"))
+        except ValueError:
+            timeout = 5.0
+        client = brevo_api.BrevoClient(api_key, timeout=max(1.0, min(10.0, timeout)))
+    try:
+        result = client.upsert_contact(dict(row), list_id)
+        database.record_brevo_sync(
+            conn, row["place_id"], result.get("id"), list_id, synced_email=row["email"],
+        )
+        return "sincronizado"
+    except (brevo_api.BrevoAPIError, ValueError) as error:
+        database.record_brevo_sync(conn, row["place_id"], None, list_id, error=str(error))
+        status_code = getattr(error, "status_code", None)
+        systemic = isinstance(error, brevo_api.BrevoAPIError) and (
+            status_code is None or status_code not in {400, 409, 422}
+        )
+        return "falha_sistemica" if systemic else "falha_contato"
+
+
 def _require_brevo_unlocked():
     if not _brevo_unlocked():
         abort(403, description="Desbloqueie a integração Brevo antes de sincronizar.")
@@ -443,13 +527,26 @@ def _require_brevo_unlocked():
 @app.get("/brevo")
 def brevo_page():
     configured = bool(os.environ.get("BREVO_API_KEY", "").strip() and os.environ.get("BREVO_SYNC_PASSWORD", ""))
+    try:
+        auto_list_id = int(os.environ.get("BREVO_AUTO_SYNC_LIST_ID", ""))
+    except ValueError:
+        auto_list_id = 0
+    auto_active = bool(
+        os.environ.get("BREVO_AUTO_SYNC", "").lower() in {"1", "true", "yes"}
+        and auto_list_id > 0
+    )
+    auto_notice = (
+        "<p><b>Armazenamento automático controlado: ativo.</b> "
+        "Somente contatos relevantes são guardados; isso não dispara campanhas.</p>"
+        if auto_active else ""
+    )
     if not configured:
         body = "<section class=\"card\"><h1>Brevo</h1><p>Integração ainda não configurada. Defina BREVO_API_KEY e BREVO_SYNC_PASSWORD no ambiente do servidor.</p></section>"
     elif not _brevo_unlocked():
-        body = f'''<section class="card"><h1>Desbloquear Brevo</h1><p>Esta senha protege a sincronização porque a página principal é pública.</p><form method="post" action="/brevo/desbloquear">{_csrf_input()}<label>Senha da integração<input type="password" name="password" autocomplete="current-password" required></label><button class="btn" type="submit">Desbloquear</button></form></section>'''
+        body = f'''<section class="card"><h1>Desbloquear Brevo</h1>{auto_notice}<p>Esta senha protege a sincronização manual porque a página principal é pública.</p><form method="post" action="/brevo/desbloquear">{_csrf_input()}<label>Senha da integração<input type="password" name="password" autocomplete="current-password" required></label><button class="btn" type="submit">Desbloquear</button></form></section>'''
     else:
-        body = f'''<section class="card"><h1>Brevo conectado</h1><p>Selecione os contatos na página de leads e use “Preparar envio ao Brevo”. Nenhuma campanha é disparada automaticamente.</p><a class="btn" href="/leads">Selecionar contatos</a><form method="post" action="/brevo/sair">{_csrf_input()}<button class="btn secondary" type="submit">Bloquear integração</button></form></section>'''
-    return render_page("Brevo", "sincronização manual", body)
+        body = f'''<section class="card"><h1>Brevo conectado</h1>{auto_notice}<p>Você também pode selecionar contatos na página de leads e usar “Preparar envio ao Brevo”. Nenhuma campanha é disparada automaticamente.</p><a class="btn" href="/leads">Selecionar contatos</a><form method="post" action="/brevo/sair">{_csrf_input()}<button class="btn secondary" type="submit">Bloquear integração</button></form></section>'''
+    return render_page("Brevo", "armazenamento controlado", body)
 
 
 @app.post("/brevo/desbloquear")
@@ -525,7 +622,10 @@ def brevo_sync():
             continue
         try:
             result = client.upsert_contact(dict(row), list_id)
-            database.record_brevo_sync(conn, row["place_id"], result.get("id"), list_id)
+            database.record_brevo_sync(
+                conn, row["place_id"], result.get("id"), list_id,
+                synced_email=row["email"],
+            )
             ok += 1
         except (brevo_api.BrevoAPIError, ValueError) as error:
             database.record_brevo_sync(conn, row["place_id"], None, list_id, error=str(error))

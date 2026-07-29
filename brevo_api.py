@@ -1,4 +1,4 @@
-"""Cliente mínimo da API Brevo para sincronização manual de contatos."""
+"""Cliente mínimo da API Brevo para armazenamento controlado de contatos."""
 
 import re
 

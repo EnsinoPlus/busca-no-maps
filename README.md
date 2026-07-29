@@ -15,7 +15,7 @@ Aplicação Flask + SQLite, em PT-BR, para prospectar negócios públicos pela G
 - CSV neutralizado contra fórmulas e XLSX formatado; exportação selecionada, filtrada ou ainda não exportada;
 - painel diário persistente de requisições e custo **estimado**;
 - backup SQLite online diário/lazy e manual em `backups/`, com retenção de 30 arquivos.
-- sincronização manual e confirmada de contatos com listas do Brevo, sem disparo automático de campanhas.
+- armazenamento automático controlado de contatos relevantes no Brevo, com sincronização manual disponível e sem disparo automático de campanhas.
 
 As migrações são aditivas e idempotentes: bancos existentes são atualizados sem apagar leads.
 
@@ -44,6 +44,10 @@ Variáveis principais (veja `.env.example`):
 - `EMAIL_MX_CHECK=0`: desativa consulta MX limitada, se necessário.
 - `BREVO_API_KEY`: chave da API Brevo, usada somente no backend;
 - `BREVO_SYNC_PASSWORD`: senha exclusiva para desbloquear a sincronização na interface pública.
+- `BREVO_AUTO_SYNC=1`: guarda automaticamente no Brevo os contatos que atendem aos critérios conservadores;
+- `BREVO_AUTO_SYNC_LIST_ID`: ID positivo da lista de destino revisada;
+- `BREVO_AUTO_SYNC_MIN_CONFIDENCE`: confiança mínima entre 0 e 100; padrão `80`;
+- `BREVO_AUTO_SYNC_TIMEOUT`: timeout por contato entre 1 e 10 segundos; padrão `5`.
 
 Confirme preços e cobrança reais no Google Cloud; o painel exibe estimativas, não faturas.
 
@@ -71,9 +75,11 @@ A aplicação mantém autenticação fail-closed em produção, rate limiting, C
 4. Em **Leads**, selecione até 50 registros e clique em **Preparar envio ao Brevo**.
 5. Confira a quantidade com e-mail válido, escolha a lista e confirme.
 
+Para guardar automaticamente somente os contatos relevantes, defina também `BREVO_AUTO_SYNC=1` e `BREVO_AUTO_SYNC_LIST_ID` com o ID da lista de destino. A aplicação considera relevante apenas um e-mail sintaticamente válido, de qualidade `alta`, com confiança igual ou superior ao limite configurado, domínio alinhado ao site, MX válido e lead não descartado. Contatos já sincronizados na mesma lista não geram nova chamada. Uma falha sistêmica interrompe as demais tentativas Brevo daquela busca, mas não interrompe a pesquisa nem a gravação local dos leads.
+
 A autorização expira após 15 minutos e é invalidada automaticamente quando `BREVO_SYNC_PASSWORD` é alterada. A operação é idempotente por e-mail (`updateEnabled=true`): contatos existentes são atualizados em vez de duplicados. Leads sem e-mail válido são ignorados; falhas específicas de um contato não interrompem o lote, enquanto indisponibilidade, HTTP 5xx ou limite 429 interrompem os contatos restantes com segurança. A aplicação registra o identificador remoto, a lista, a última tentativa e o último erro seguro. A chave nunca é enviada ao navegador nem incluída nos logs.
 
-Esta primeira etapa somente cria/atualiza o contato e o associa a uma lista. Ela **não dispara campanhas**, não marca consentimento e não reinscreve deliberadamente contatos descadastrados. Antes de qualquer campanha, valide a base legal, a identificação do remetente, o opt-out e as supressões conforme a LGPD e as políticas do Brevo.
+Tanto o modo automático controlado quanto o manual somente criam/atualizam o contato e o associam a uma lista. Eles **não disparam campanhas**, não marcam consentimento e não reinscrevem deliberadamente contatos descadastrados. Antes de qualquer campanha, valide a base legal, a identificação do remetente, o opt-out e as supressões conforme a LGPD e as políticas do Brevo.
 
 ## Verificação
 

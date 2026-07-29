@@ -1,6 +1,9 @@
-"""Testes da sincronização manual e segura com o Brevo, sem chamadas reais."""
+"""Testes do armazenamento manual e automático no Brevo, sem chamadas reais."""
 import os
 import sys
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
 import pytest
@@ -130,6 +133,366 @@ def test_database_records_brevo_success_and_preserves_it_after_later_error(monke
         "2026-07-29T16:05:00+00:00", "Falha segura",
     )
     assert "Falha na última tentativa; sincronizado anteriormente" in crm_html
+
+
+def test_automatic_brevo_sync_stores_relevant_lead_without_campaign(monkeypatch, tmp_path):
+    monkeypatch.setenv("LEADS_DB_PATH", str(tmp_path / "automatic.db"))
+    monkeypatch.setenv("BREVO_AUTO_SYNC", "1")
+    monkeypatch.setenv("BREVO_AUTO_SYNC_LIST_ID", "7")
+    conn = database.get_connection()
+    database.upsert_lead(conn, {
+        "place_id": "relevante",
+        "name": "Empresa relevante",
+        "email": "contato@empresa.test",
+        "email_quality": "alta",
+        "email_confidence": 95,
+        "email_domain_aligned": 1,
+        "email_mx_valid": 1,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    })
+    calls = []
+
+    class FakeClient:
+        def upsert_contact(self, lead, list_id):
+            calls.append((lead["email"], list_id))
+            return {"id": 321}
+
+    result = webapp._auto_sync_brevo_lead(conn, "relevante", client=FakeClient())
+    row = conn.execute(
+        "SELECT brevo_contact_id,brevo_list_id,brevo_synced_at,brevo_sync_error "
+        "FROM leads WHERE place_id='relevante'"
+    ).fetchone()
+    conn.close()
+
+    assert result == "sincronizado"
+    assert calls == [("contato@empresa.test", 7)]
+    assert tuple(row[:2]) == ("321", 7)
+    assert row[2]
+    assert row[3] is None
+
+
+def test_automatic_brevo_sync_records_safe_error_without_breaking_search(monkeypatch, tmp_path):
+    import brevo_api
+
+    monkeypatch.setenv("LEADS_DB_PATH", str(tmp_path / "automatic-error.db"))
+    monkeypatch.setenv("BREVO_AUTO_SYNC", "1")
+    monkeypatch.setenv("BREVO_AUTO_SYNC_LIST_ID", "7")
+    conn = database.get_connection()
+    database.upsert_lead(conn, {
+        "place_id": "falha",
+        "email": "contato@empresa.test",
+        "email_quality": "alta",
+        "email_confidence": 95,
+        "email_domain_aligned": 1,
+        "email_mx_valid": 1,
+    })
+
+    class FailingClient:
+        def upsert_contact(self, lead, list_id):
+            raise brevo_api.BrevoAPIError("Falha segura.", status_code=429)
+
+    result = webapp._auto_sync_brevo_lead(conn, "falha", client=FailingClient())
+    row = conn.execute(
+        "SELECT brevo_contact_id,brevo_last_attempt_at,brevo_sync_error "
+        "FROM leads WHERE place_id='falha'"
+    ).fetchone()
+    conn.close()
+
+    assert result == "falha_sistemica"
+    assert row[0] is None
+    assert row[1]
+    assert row[2] == "Falha segura."
+
+
+def test_automatic_brevo_sync_respects_configured_relevance_threshold(monkeypatch, tmp_path):
+    monkeypatch.setenv("LEADS_DB_PATH", str(tmp_path / "automatic-threshold.db"))
+    monkeypatch.setenv("BREVO_AUTO_SYNC", "1")
+    monkeypatch.setenv("BREVO_AUTO_SYNC_LIST_ID", "7")
+    monkeypatch.setenv("BREVO_AUTO_SYNC_MIN_CONFIDENCE", "90")
+    conn = database.get_connection()
+    database.upsert_lead(conn, {
+        "place_id": "abaixo-do-limite",
+        "email": "contato@empresa.test",
+        "email_quality": "alta",
+        "email_confidence": 85,
+        "email_domain_aligned": 1,
+        "email_mx_valid": 1,
+    })
+
+    class UnexpectedClient:
+        def upsert_contact(self, lead, list_id):
+            raise AssertionError("Lead abaixo da confiança mínima não deve ir ao Brevo")
+
+    result = webapp._auto_sync_brevo_lead(
+        conn, "abaixo-do-limite", client=UnexpectedClient(),
+    )
+    row = conn.execute(
+        "SELECT brevo_last_attempt_at FROM leads WHERE place_id='abaixo-do-limite'"
+    ).fetchone()
+    conn.close()
+
+    assert result == "ignorado"
+    assert row[0] is None
+
+
+def test_automatic_brevo_sync_uses_short_configurable_timeout(monkeypatch, tmp_path):
+    monkeypatch.setenv("LEADS_DB_PATH", str(tmp_path / "automatic-timeout.db"))
+    monkeypatch.setenv("BREVO_AUTO_SYNC", "1")
+    monkeypatch.setenv("BREVO_AUTO_SYNC_LIST_ID", "7")
+    monkeypatch.setenv("BREVO_AUTO_SYNC_TIMEOUT", "4")
+    monkeypatch.setenv("BREVO_API_KEY", "chave-de-teste")
+    conn = database.get_connection()
+    database.upsert_lead(conn, {
+        "place_id": "relevante",
+        "email": "contato@empresa.test",
+        "email_quality": "alta",
+        "email_confidence": 95,
+        "email_domain_aligned": 1,
+        "email_mx_valid": 1,
+    })
+    timeouts = []
+
+    class FakeClient:
+        def __init__(self, api_key, timeout):
+            assert api_key == "chave-de-teste"
+            timeouts.append(timeout)
+
+        def upsert_contact(self, lead, list_id):
+            return {"id": 654}
+
+    monkeypatch.setattr(webapp.brevo_api, "BrevoClient", FakeClient)
+
+    result = webapp._auto_sync_brevo_lead(conn, "relevante")
+    conn.close()
+
+    assert result == "sincronizado"
+    assert timeouts == [4.0]
+
+
+def test_automatic_brevo_sync_does_not_repeat_contact_already_in_target_list(monkeypatch, tmp_path):
+    monkeypatch.setenv("LEADS_DB_PATH", str(tmp_path / "automatic-idempotent.db"))
+    monkeypatch.setenv("BREVO_AUTO_SYNC", "1")
+    monkeypatch.setenv("BREVO_AUTO_SYNC_LIST_ID", "7")
+    conn = database.get_connection()
+    database.upsert_lead(conn, {
+        "place_id": "sincronizado",
+        "email": "contato@empresa.test",
+        "email_quality": "alta",
+        "email_confidence": 95,
+        "email_domain_aligned": 1,
+        "email_mx_valid": 1,
+    })
+    database.record_brevo_sync(conn, "sincronizado", 777, 7)
+
+    class UnexpectedClient:
+        def upsert_contact(self, lead, list_id):
+            raise AssertionError("Contato já sincronizado não deve gerar nova chamada")
+
+    result = webapp._auto_sync_brevo_lead(
+        conn, "sincronizado", client=UnexpectedClient(),
+    )
+    conn.close()
+
+    assert result == "ja_sincronizado"
+
+
+def test_automatic_brevo_sync_updates_when_relevant_email_changes(monkeypatch, tmp_path):
+    monkeypatch.setenv("LEADS_DB_PATH", str(tmp_path / "automatic-email-change.db"))
+    monkeypatch.setenv("BREVO_AUTO_SYNC", "1")
+    monkeypatch.setenv("BREVO_AUTO_SYNC_LIST_ID", "7")
+    conn = database.get_connection()
+    database.upsert_lead(conn, {
+        "place_id": "email-alterado",
+        "email": "antigo@empresa.test",
+        "email_quality": "alta",
+        "email_confidence": 90,
+        "email_domain_aligned": 1,
+        "email_mx_valid": 1,
+    })
+    database.record_brevo_sync(conn, "email-alterado", 777, 7)
+    conn.execute(
+        "UPDATE leads SET email=?,normalized_email=?,email_confidence=? WHERE place_id=?",
+        ("novo@empresa.test", "novo@empresa.test", 95, "email-alterado"),
+    )
+    conn.commit()
+    calls = []
+
+    class FakeClient:
+        def upsert_contact(self, lead, list_id):
+            calls.append((lead["email"], list_id))
+            return {"id": 888}
+
+    result = webapp._auto_sync_brevo_lead(
+        conn, "email-alterado", client=FakeClient(),
+    )
+    conn.close()
+
+    assert result == "sincronizado"
+    assert calls == [("novo@empresa.test", 7)]
+
+
+def test_automatic_brevo_sync_records_the_email_snapshot_actually_sent(monkeypatch, tmp_path):
+    monkeypatch.setenv("LEADS_DB_PATH", str(tmp_path / "automatic-email-race.db"))
+    monkeypatch.setenv("BREVO_AUTO_SYNC", "1")
+    monkeypatch.setenv("BREVO_AUTO_SYNC_LIST_ID", "7")
+    conn = database.get_connection()
+    database.upsert_lead(conn, {
+        "place_id": "corrida",
+        "email": "enviado@empresa.test",
+        "email_quality": "alta",
+        "email_confidence": 95,
+        "email_domain_aligned": 1,
+        "email_mx_valid": 1,
+    })
+
+    class ConcurrentChangeClient:
+        def upsert_contact(self, lead, list_id):
+            assert lead["email"] == "enviado@empresa.test"
+            conn.execute(
+                "UPDATE leads SET email=?,normalized_email=? WHERE place_id=?",
+                ("novo@empresa.test", "novo@empresa.test", "corrida"),
+            )
+            conn.commit()
+            return {"id": 999}
+
+    result = webapp._auto_sync_brevo_lead(
+        conn, "corrida", client=ConcurrentChangeClient(),
+    )
+    row = conn.execute(
+        "SELECT normalized_email,brevo_synced_email FROM leads WHERE place_id='corrida'"
+    ).fetchone()
+    conn.close()
+
+    assert result == "sincronizado"
+    assert tuple(row) == ("novo@empresa.test", "enviado@empresa.test")
+
+
+def test_manual_brevo_sync_records_the_email_snapshot_actually_sent(monkeypatch, tmp_path):
+    monkeypatch.setenv("LEADS_DB_PATH", str(tmp_path / "manual-email-race.db"))
+    monkeypatch.setenv("BREVO_SYNC_PASSWORD", "senha-de-teste")
+    conn = database.get_connection()
+    database.upsert_lead(conn, {
+        "place_id": "corrida-manual",
+        "email": "enviado@empresa.test",
+    })
+    conn.close()
+
+    class ConcurrentChangeClient:
+        def upsert_contact(self, lead, list_id):
+            assert lead["email"] == "enviado@empresa.test"
+            update_conn = database.get_connection()
+            update_conn.execute(
+                "UPDATE leads SET email=?,normalized_email=? WHERE place_id=?",
+                ("novo@empresa.test", "novo@empresa.test", "corrida-manual"),
+            )
+            update_conn.commit()
+            update_conn.close()
+            return {"id": 1001}
+
+    monkeypatch.setattr(webapp, "_brevo_client", ConcurrentChangeClient)
+    webapp._reset_rate_limits()
+    with webapp.app.test_request_context(
+        "/brevo/sincronizar",
+        method="POST",
+        data={"ids": ["corrida-manual"], "list_id": "7"},
+    ):
+        webapp._mark_brevo_unlocked()
+        webapp.session["brevo_list_ids"] = [7]
+        webapp.session["brevo_lead_ids"] = ["corrida-manual"]
+        response = webapp.brevo_sync()
+
+    conn = database.get_connection()
+    row = conn.execute(
+        "SELECT normalized_email,brevo_synced_email "
+        "FROM leads WHERE place_id='corrida-manual'"
+    ).fetchone()
+    conn.close()
+
+    assert "brevo_ok=1" in response.headers["Location"]
+    assert tuple(row) == ("novo@empresa.test", "enviado@empresa.test")
+
+
+def test_automatic_brevo_sync_serializes_same_contact_across_search_threads(monkeypatch, tmp_path):
+    monkeypatch.setenv("LEADS_DB_PATH", str(tmp_path / "automatic-concurrent.db"))
+    monkeypatch.setenv("BREVO_AUTO_SYNC", "1")
+    monkeypatch.setenv("BREVO_AUTO_SYNC_LIST_ID", "7")
+    conn = database.get_connection()
+    database.upsert_lead(conn, {
+        "place_id": "concorrente",
+        "email": "contato@empresa.test",
+        "email_quality": "alta",
+        "email_confidence": 95,
+        "email_domain_aligned": 1,
+        "email_mx_valid": 1,
+    })
+    conn.close()
+    first_entered = threading.Event()
+    release_first = threading.Event()
+
+    class SlowClient:
+        def __init__(self):
+            self.calls = 0
+            self.lock = threading.Lock()
+
+        def upsert_contact(self, lead, list_id):
+            with self.lock:
+                self.calls += 1
+                call_number = self.calls
+            if call_number == 1:
+                first_entered.set()
+                assert release_first.wait(timeout=3)
+            return {"id": 1000 + call_number}
+
+    client = SlowClient()
+
+    def sync_once():
+        thread_conn = database.get_connection()
+        try:
+            return webapp._auto_sync_brevo_lead(
+                thread_conn, "concorrente", client=client,
+            )
+        finally:
+            thread_conn.close()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(sync_once)
+        assert first_entered.wait(timeout=3)
+        second = pool.submit(sync_once)
+        time.sleep(0.1)
+        release_first.set()
+        results = [first.result(timeout=3), second.result(timeout=3)]
+
+    assert client.calls == 1
+    assert sorted(results) == ["ja_sincronizado", "sincronizado"]
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        RuntimeError("privado"), KeyError("privado"), IndexError("privado"),
+        OverflowError("privado"), AssertionError("privado"),
+    ],
+)
+def test_unexpected_automatic_brevo_failure_is_isolated_from_search(monkeypatch, failure):
+    def unexpected_failure(conn, place_id, client=None):
+        raise failure
+
+    monkeypatch.setattr(webapp, "_auto_sync_brevo_lead", unexpected_failure)
+
+    assert webapp._attempt_auto_sync_brevo(None, "lead-privado") == "falha_sistemica"
+
+
+def test_brevo_page_reports_when_controlled_automatic_storage_is_active(monkeypatch):
+    monkeypatch.setenv("APP_PUBLIC_ACCESS", "1")
+    monkeypatch.setenv("BREVO_API_KEY", "chave-de-teste")
+    monkeypatch.setenv("BREVO_SYNC_PASSWORD", "senha-de-teste")
+    monkeypatch.setenv("BREVO_AUTO_SYNC", "1")
+    monkeypatch.setenv("BREVO_AUTO_SYNC_LIST_ID", "7")
+
+    html = webapp.app.test_client().get("/brevo").get_data(as_text=True)
+
+    assert "Armazenamento automático controlado: ativo" in html
+    assert "não dispara campanhas" in html.lower()
 
 
 def test_manual_brevo_sync_requires_unlock_confirmation_and_real_email(monkeypatch, tmp_path):

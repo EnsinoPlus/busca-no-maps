@@ -50,7 +50,7 @@ def test_additive_migration_adds_v2_fields_and_operational_tables(monkeypatch, t
     assert {"email_quality", "email_confidence", "status", "notes", "assignee", "tags",
             "last_contact_at", "next_followup_at", "exported_at", "segment", "city", "uf",
             "normalized_email", "normalized_phone", "normalized_domain", "normalized_name_address",
-            "brevo_contact_id", "brevo_list_id", "brevo_synced_at", "brevo_last_attempt_at",
+            "brevo_contact_id", "brevo_list_id", "brevo_synced_email", "brevo_synced_at", "brevo_last_attempt_at",
             "brevo_sync_error"} <= columns
     assert {"api_usage", "backups"} <= tables
     assert conn.execute("SELECT name FROM leads WHERE place_id='old'").fetchone()[0] == "Legado"
@@ -220,6 +220,12 @@ def test_stream_search_counts_only_new_or_upgraded_real_email_and_stops_at_targe
     monkeypatch.setattr(webapp.lead_quality, "assess_email", lambda *args, **kwargs: {
         "quality": "alta", "confidence": 90, "domain_aligned": True, "mx_valid": True
     })
+    automatic_syncs = []
+    monkeypatch.setattr(
+        webapp,
+        "_auto_sync_brevo_lead",
+        lambda conn, place_id: automatic_syncs.append(place_id) or "sincronizado",
+    )
     client = webapp.app.test_client(); token = csrf(client)
     response = client.post("/buscar", data={
         "segment": "advocacia", "city": "Mossoró", "uf": "RN", "location": "Centro",
@@ -239,9 +245,52 @@ def test_stream_search_counts_only_new_or_upgraded_real_email_and_stops_at_targe
     assert '"phase": "erro_detalhes"' in text
     assert '"new_email_leads": 2' in text
     assert calls == ["dup", "fail", "none", "upgrade", "fresh"]
+    assert automatic_syncs == ["dup", "upgrade", "fresh"]
     assert candidate_limits == [20]
     assert usage_by_endpoint == {"place_details": 5, "text_search": 1, "website_check": 4}
     assert usage["estimated_cost"] == 0
+
+
+def test_search_stops_automatic_brevo_attempts_after_systemic_failure(monkeypatch, tmp_path):
+    monkeypatch.setenv("LEADS_DB_PATH", str(tmp_path / "brevo-circuit.db"))
+    monkeypatch.setenv("API_DAILY_REQUEST_CEILING", "50")
+    candidates = [
+        {"place_id": place_id, "name": place_id, "types": [], "geometry": {"location": {}}}
+        for place_id in ("a", "b", "c")
+    ]
+
+    def text_search(query, max_results):
+        webapp.places_api._record_request(webapp.places_api.NEW_TEXT_URL)
+        return candidates
+
+    def details(place_id):
+        webapp.places_api._record_request(
+            webapp.places_api.NEW_DETAILS_URL.format(place_id=place_id),
+        )
+        return {"name": place_id, "website": f"https://{place_id}.example"}
+
+    monkeypatch.setattr(webapp.places_api, "text_search", text_search)
+    monkeypatch.setattr(webapp.places_api, "place_details", details)
+    monkeypatch.setattr(
+        webapp.email_finder,
+        "find_email",
+        lambda site: (f"contato@{site.split('//')[1]}", site, None),
+    )
+    monkeypatch.setattr(webapp.lead_quality, "assess_email", lambda *args, **kwargs: {
+        "quality": "alta", "confidence": 95, "domain_aligned": True, "mx_valid": True,
+    })
+    automatic_syncs = []
+
+    def fail_systemically(conn, place_id):
+        automatic_syncs.append(place_id)
+        return "falha_sistemica"
+
+    monkeypatch.setattr(webapp, "_auto_sync_brevo_lead", fail_systemically)
+
+    events = list(webapp._search_events("advocacia", "Natal", "RN", ["advocacia Natal"], 3))
+
+    assert events[-1]["new_email_leads"] == 3
+    assert automatic_syncs == ["a"]
 
 
 def test_search_assets_stream_securely_and_support_cancel(monkeypatch, tmp_path):
