@@ -95,6 +95,15 @@ def _migrate(conn):
             CREATE TABLE IF NOT EXISTS backups (
                 filename TEXT PRIMARY KEY, created_at TEXT NOT NULL, size_bytes INTEGER NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS brevo_sync_state (
+                place_id TEXT NOT NULL,
+                list_id INTEGER NOT NULL,
+                synced_email TEXT NOT NULL,
+                contact_id TEXT,
+                synced_at TEXT NOT NULL,
+                PRIMARY KEY(place_id,list_id,synced_email),
+                FOREIGN KEY(place_id) REFERENCES leads(place_id) ON DELETE CASCADE
+            );
             CREATE INDEX IF NOT EXISTS idx_leads_email ON leads(normalized_email);
             CREATE INDEX IF NOT EXISTS idx_leads_phone ON leads(normalized_phone);
             CREATE INDEX IF NOT EXISTS idx_leads_domain ON leads(normalized_domain);
@@ -113,6 +122,18 @@ def _migrate(conn):
                 (normalize_email(email), normalize_phone(phone), normalize_domain(website or email),
                  normalize_name_address(name, address), pid),
             )
+        conn.execute(
+            "UPDATE leads SET brevo_synced_email=normalized_email "
+            "WHERE brevo_synced_email IS NULL AND brevo_synced_at IS NOT NULL "
+            "AND brevo_list_id IS NOT NULL AND normalized_email IS NOT NULL"
+        )
+        conn.execute(
+            "INSERT OR IGNORE INTO brevo_sync_state "
+            "(place_id,list_id,synced_email,contact_id,synced_at) "
+            "SELECT place_id,brevo_list_id,brevo_synced_email,brevo_contact_id,brevo_synced_at "
+            "FROM leads WHERE brevo_synced_at IS NOT NULL AND brevo_list_id IS NOT NULL "
+            "AND brevo_synced_email IS NOT NULL"
+        )
         conn.commit()
     except sqlite3.Error:
         conn.rollback()
@@ -299,8 +320,35 @@ def record_brevo_sync(
                 int(list_id), normalized_synced_email, attempted_at, attempted_at, place_id,
             ),
         )
+        if normalized_synced_email is None:
+            current = conn.execute(
+                "SELECT normalized_email FROM leads WHERE place_id=?", (place_id,),
+            ).fetchone()
+            normalized_synced_email = current[0] if current else None
+        if cur.rowcount == 1 and normalized_synced_email:
+            conn.execute(
+                "INSERT INTO brevo_sync_state "
+                "(place_id,list_id,synced_email,contact_id,synced_at) VALUES (?,?,?,?,?) "
+                "ON CONFLICT(place_id,list_id,synced_email) DO UPDATE SET "
+                "contact_id=excluded.contact_id,synced_at=excluded.synced_at",
+                (
+                    place_id, int(list_id), normalized_synced_email,
+                    str(contact_id) if contact_id is not None else None, attempted_at,
+                ),
+            )
     conn.commit()
     return cur.rowcount == 1
+
+
+def has_brevo_sync(conn, place_id, list_id, email):
+    normalized = normalize_email(email)
+    if not normalized:
+        return False
+    return bool(conn.execute(
+        "SELECT EXISTS(SELECT 1 FROM brevo_sync_state "
+        "WHERE place_id=? AND list_id=? AND synced_email=?)",
+        (place_id, int(list_id), normalized),
+    ).fetchone()[0])
 
 
 def safe_cell(value):

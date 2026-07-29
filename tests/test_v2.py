@@ -52,7 +52,7 @@ def test_additive_migration_adds_v2_fields_and_operational_tables(monkeypatch, t
             "normalized_email", "normalized_phone", "normalized_domain", "normalized_name_address",
             "brevo_contact_id", "brevo_list_id", "brevo_synced_email", "brevo_synced_at", "brevo_last_attempt_at",
             "brevo_sync_error"} <= columns
-    assert {"api_usage", "backups"} <= tables
+    assert {"api_usage", "backups", "brevo_sync_state"} <= tables
     assert conn.execute("SELECT name FROM leads WHERE place_id='old'").fetchone()[0] == "Legado"
     exported = tmp_path / "legacy.csv"
     database.export_csv(conn, str(exported))
@@ -69,6 +69,40 @@ def test_additive_migration_adds_v2_fields_and_operational_tables(monkeypatch, t
     assert backup_conn.execute("SELECT name FROM leads WHERE place_id='old'").fetchone()[0] == "Legado"
     backup_conn.close()
     conn.close()
+
+
+def test_migration_backfills_brevo_success_history_for_legacy_synced_leads(monkeypatch, tmp_path):
+    db = tmp_path / "legacy-brevo.db"
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "CREATE TABLE leads (place_id TEXT PRIMARY KEY,email TEXT,normalized_email TEXT,"
+        "brevo_contact_id TEXT,brevo_list_id INTEGER,brevo_synced_at TEXT)"
+    )
+    conn.execute(
+        "INSERT INTO leads VALUES (?,?,?,?,?,?)",
+        (
+            "legado-brevo", "Contato@Empresa.test", "contato@empresa.test",
+            "321", 7, "2026-07-29T12:00:00+00:00",
+        ),
+    )
+    conn.commit()
+    conn.close()
+    monkeypatch.setenv("LEADS_DB_PATH", str(db))
+
+    conn = database.get_connection()
+    history = conn.execute(
+        "SELECT place_id,list_id,synced_email,contact_id,synced_at "
+        "FROM brevo_sync_state WHERE place_id='legado-brevo'"
+    ).fetchone()
+    lead = conn.execute(
+        "SELECT brevo_synced_email FROM leads WHERE place_id='legado-brevo'"
+    ).fetchone()
+    conn.close()
+
+    assert tuple(history) == (
+        "legado-brevo", 7, "contato@empresa.test", "321", "2026-07-29T12:00:00+00:00",
+    )
+    assert lead[0] == "contato@empresa.test"
 
 
 def test_additive_migration_is_serialized_between_concurrent_connections(monkeypatch, tmp_path):

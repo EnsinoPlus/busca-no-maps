@@ -65,6 +65,8 @@ PAGE_SIZE = 25
 _rate_limit_events = defaultdict(deque)
 _rate_limit_lock = threading.Lock()
 _auto_brevo_sync_lock = threading.Lock()
+_auto_brevo_list_cache = {}
+AUTO_BREVO_LIST_CACHE_SECONDS = 300
 _monotonic = time.monotonic
 log = logging.getLogger("leads_maps")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -485,12 +487,9 @@ def _auto_sync_brevo_lead_locked(conn, place_id, client=None):
     )
     if not relevant:
         return "ignorado"
-    if (
-        row["brevo_synced_at"]
-        and row["brevo_list_id"] == list_id
-        and row["brevo_synced_email"] == row["normalized_email"]
-    ):
+    if database.has_brevo_sync(conn, row["place_id"], list_id, row["email"]):
         return "ja_sincronizado"
+    list_cache_key = None
     if client is None:
         api_key = os.environ.get("BREVO_API_KEY", "").strip()
         if not api_key:
@@ -499,11 +498,39 @@ def _auto_sync_brevo_lead_locked(conn, place_id, client=None):
                 error="Integração Brevo não configurada.",
             )
             return "falha_sistemica"
+        timeout = max(1.0, min(_env_float("BREVO_AUTO_SYNC_TIMEOUT", 5.0), 10.0))
+        client = brevo_api.BrevoClient(api_key, timeout=timeout)
+        list_cache_key = (hashlib.sha256(api_key.encode("utf-8")).hexdigest(), list_id)
+        cached = _auto_brevo_list_cache.get(list_cache_key)
+        cache_current = (
+            cached and time.monotonic() - cached[0] < AUTO_BREVO_LIST_CACHE_SECONDS
+        )
         try:
-            timeout = float(os.environ.get("BREVO_AUTO_SYNC_TIMEOUT", "5"))
-        except ValueError:
-            timeout = 5.0
-        client = brevo_api.BrevoClient(api_key, timeout=max(1.0, min(10.0, timeout)))
+            if cache_current:
+                list_available = cached[1]
+            else:
+                remote_list_ids = {
+                    item.get("id")
+                    for item in client.list_contact_lists()
+                    if isinstance(item, dict)
+                    and type(item.get("id")) is int
+                    and item["id"] > 0
+                }
+                list_available = list_id in remote_list_ids
+                _auto_brevo_list_cache[list_cache_key] = (
+                    time.monotonic(), list_available,
+                )
+        except brevo_api.BrevoAPIError as error:
+            database.record_brevo_sync(
+                conn, row["place_id"], None, list_id, error=str(error),
+            )
+            return "falha_sistemica"
+        if not list_available:
+            database.record_brevo_sync(
+                conn, row["place_id"], None, list_id,
+                error="Lista automática do Brevo indisponível.",
+            )
+            return "falha_sistemica"
     try:
         result = client.upsert_contact(dict(row), list_id)
         database.record_brevo_sync(
@@ -513,6 +540,8 @@ def _auto_sync_brevo_lead_locked(conn, place_id, client=None):
     except (brevo_api.BrevoAPIError, ValueError) as error:
         database.record_brevo_sync(conn, row["place_id"], None, list_id, error=str(error))
         status_code = getattr(error, "status_code", None)
+        if list_cache_key and status_code in {400, 409, 422}:
+            _auto_brevo_list_cache.pop(list_cache_key, None)
         systemic = isinstance(error, brevo_api.BrevoAPIError) and (
             status_code is None or status_code not in {400, 409, 422}
         )

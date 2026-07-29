@@ -59,19 +59,32 @@ class BrevoClient:
             raise BrevoAPIError("O Brevo retornou uma resposta inválida.") from error
 
     def list_contact_lists(self):
-        payload = self._request(
-            "GET",
-            "/contacts/lists",
-            params={"limit": 50, "offset": 0, "sort": "desc"},
-        )
         lists = []
-        for item in payload.get("lists", []):
-            try:
-                list_id = int(item.get("id"))
-            except (TypeError, ValueError):
-                continue
-            if list_id > 0:
-                lists.append({"id": list_id, "name": str(item.get("name") or f"Lista {list_id}")})
+        limit = 50
+        offset = 0
+        while offset < 1000:
+            payload = self._request(
+                "GET",
+                "/contacts/lists",
+                params={"limit": limit, "offset": offset, "sort": "desc"},
+            )
+            page = payload.get("lists", [])
+            if not isinstance(page, list):
+                raise BrevoAPIError("O Brevo retornou uma resposta inválida.")
+            for item in page:
+                try:
+                    list_id = int(item.get("id"))
+                except (AttributeError, TypeError, ValueError):
+                    continue
+                if list_id > 0:
+                    lists.append({
+                        "id": list_id,
+                        "name": str(item.get("name") or f"Lista {list_id}"),
+                    })
+            total = payload.get("count")
+            if not page or len(page) < limit or (type(total) is int and offset + len(page) >= total):
+                break
+            offset += len(page)
         return lists
 
     def upsert_contact(self, lead, list_id):

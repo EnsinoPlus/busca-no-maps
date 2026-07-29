@@ -12,6 +12,7 @@ from werkzeug.exceptions import BadRequest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import app as webapp
+import brevo_api
 import database
 
 
@@ -63,6 +64,21 @@ def test_brevo_client_lists_and_upserts_without_sending_campaigns():
     assert all("campaign" not in call[1] for call in session.calls)
     assert all(call[2]["headers"]["api-key"] == "segredo-de-teste" for call in session.calls)
     assert all(call[2]["timeout"] == 4 for call in session.calls)
+
+
+def test_brevo_client_paginates_contact_lists():
+    first_page = [{"id": item, "name": f"Lista {item}"} for item in range(1, 51)]
+    session = RecordingSession([
+        FakeResponse(200, {"count": 51, "lists": first_page}),
+        FakeResponse(200, {"count": 51, "lists": [{"id": 51, "name": "Destino"}]}),
+    ])
+    client = brevo_api.BrevoClient("segredo-de-teste", session=session)
+
+    lists = client.list_contact_lists()
+
+    assert len(lists) == 51
+    assert lists[-1] == {"id": 51, "name": "Destino"}
+    assert [call[2]["params"]["offset"] for call in session.calls] == [0, 50]
 
 
 def test_brevo_client_rejects_invalid_email_and_never_leaks_api_error_body():
@@ -204,6 +220,121 @@ def test_automatic_brevo_sync_records_safe_error_without_breaking_search(monkeyp
     assert row[2] == "Falha segura."
 
 
+def test_database_does_not_create_brevo_history_for_missing_lead(monkeypatch, tmp_path):
+    monkeypatch.setenv("LEADS_DB_PATH", str(tmp_path / "missing-lead.db"))
+    conn = database.get_connection()
+
+    recorded = database.record_brevo_sync(
+        conn, "inexistente", 123, 7, synced_email="contato@empresa.test",
+    )
+    history_count = conn.execute("SELECT COUNT(*) FROM brevo_sync_state").fetchone()[0]
+    conn.close()
+
+    assert recorded is False
+    assert history_count == 0
+
+
+def test_automatic_brevo_sync_isolates_remote_422_for_validated_contact(monkeypatch, tmp_path):
+    monkeypatch.setenv("LEADS_DB_PATH", str(tmp_path / "automatic-422.db"))
+    monkeypatch.setenv("BREVO_AUTO_SYNC", "1")
+    monkeypatch.setenv("BREVO_AUTO_SYNC_LIST_ID", "7")
+    conn = database.get_connection()
+    database.upsert_lead(conn, {
+        "place_id": "falha-422",
+        "email": "contato@empresa.test",
+        "email_quality": "alta",
+        "email_confidence": 95,
+        "email_domain_aligned": 1,
+        "email_mx_valid": 1,
+    })
+
+    class RejectedContactClient:
+        def upsert_contact(self, lead, list_id):
+            raise brevo_api.BrevoAPIError("Falha segura.", status_code=422)
+
+    result = webapp._auto_sync_brevo_lead(
+        conn, "falha-422", client=RejectedContactClient(),
+    )
+    conn.close()
+
+    assert result == "falha_contato"
+
+
+def test_automatic_brevo_sync_stops_when_configured_list_does_not_exist(monkeypatch, tmp_path):
+    monkeypatch.setenv("LEADS_DB_PATH", str(tmp_path / "automatic-missing-list.db"))
+    monkeypatch.setenv("BREVO_AUTO_SYNC", "1")
+    monkeypatch.setenv("BREVO_AUTO_SYNC_LIST_ID", "7")
+    monkeypatch.setenv("BREVO_API_KEY", "chave-lista-ausente")
+    conn = database.get_connection()
+    database.upsert_lead(conn, {
+        "place_id": "lista-ausente",
+        "email": "contato@empresa.test",
+        "email_quality": "alta",
+        "email_confidence": 95,
+        "email_domain_aligned": 1,
+        "email_mx_valid": 1,
+    })
+
+    class MissingListClient:
+        def __init__(self, api_key, timeout):
+            assert api_key == "chave-lista-ausente"
+
+        def list_contact_lists(self):
+            return [{"id": 8, "name": "Outra lista"}]
+
+        def upsert_contact(self, lead, list_id):
+            raise AssertionError("Lista ausente deve ser detectada antes do upsert")
+
+    monkeypatch.setattr(webapp.brevo_api, "BrevoClient", MissingListClient)
+    result = webapp._auto_sync_brevo_lead(conn, "lista-ausente")
+    conn.close()
+
+    assert result == "falha_sistemica"
+
+
+def test_automatic_brevo_sync_revalidates_list_after_contact_rejection(monkeypatch, tmp_path):
+    monkeypatch.setenv("LEADS_DB_PATH", str(tmp_path / "automatic-revalidate-list.db"))
+    monkeypatch.setenv("BREVO_AUTO_SYNC", "1")
+    monkeypatch.setenv("BREVO_AUTO_SYNC_LIST_ID", "7")
+    monkeypatch.setenv("BREVO_API_KEY", "chave-revalidacao")
+    conn = database.get_connection()
+    for place_id, email in (("primeiro", "um@empresa.test"), ("segundo", "dois@empresa.test")):
+        database.upsert_lead(conn, {
+            "place_id": place_id,
+            "email": email,
+            "email_quality": "alta",
+            "email_confidence": 95,
+            "email_domain_aligned": 1,
+            "email_mx_valid": 1,
+        })
+    list_checks = []
+    upserts = []
+
+    class RevalidatingClient:
+        def __init__(self, api_key, timeout):
+            assert api_key == "chave-revalidacao"
+
+        def list_contact_lists(self):
+            list_checks.append(True)
+            return [{"id": 7, "name": "Lista válida"}]
+
+        def upsert_contact(self, lead, list_id):
+            upserts.append(lead["place_id"])
+            if len(upserts) == 1:
+                raise brevo_api.BrevoAPIError("Contato rejeitado.", status_code=422)
+            return {"id": 702}
+
+    monkeypatch.setattr(webapp.brevo_api, "BrevoClient", RevalidatingClient)
+
+    first = webapp._auto_sync_brevo_lead(conn, "primeiro")
+    second = webapp._auto_sync_brevo_lead(conn, "segundo")
+    conn.close()
+
+    assert (first, second) == ("falha_contato", "sincronizado")
+    assert len(list_checks) == 2
+    assert upserts == ["primeiro", "segundo"]
+
+
 def test_automatic_brevo_sync_respects_configured_relevance_threshold(monkeypatch, tmp_path):
     monkeypatch.setenv("LEADS_DB_PATH", str(tmp_path / "automatic-threshold.db"))
     monkeypatch.setenv("BREVO_AUTO_SYNC", "1")
@@ -257,6 +388,9 @@ def test_automatic_brevo_sync_uses_short_configurable_timeout(monkeypatch, tmp_p
             assert api_key == "chave-de-teste"
             timeouts.append(timeout)
 
+        def list_contact_lists(self):
+            return [{"id": 7, "name": "Lista válida"}]
+
         def upsert_contact(self, lead, list_id):
             return {"id": 654}
 
@@ -290,6 +424,38 @@ def test_automatic_brevo_sync_does_not_repeat_contact_already_in_target_list(mon
 
     result = webapp._auto_sync_brevo_lead(
         conn, "sincronizado", client=UnexpectedClient(),
+    )
+    conn.close()
+
+    assert result == "ja_sincronizado"
+
+
+def test_automatic_brevo_sync_remembers_success_per_list_and_email(monkeypatch, tmp_path):
+    monkeypatch.setenv("LEADS_DB_PATH", str(tmp_path / "automatic-list-history.db"))
+    monkeypatch.setenv("BREVO_AUTO_SYNC", "1")
+    monkeypatch.setenv("BREVO_AUTO_SYNC_LIST_ID", "7")
+    conn = database.get_connection()
+    database.upsert_lead(conn, {
+        "place_id": "historico-listas",
+        "email": "contato@empresa.test",
+        "email_quality": "alta",
+        "email_confidence": 95,
+        "email_domain_aligned": 1,
+        "email_mx_valid": 1,
+    })
+    database.record_brevo_sync(
+        conn, "historico-listas", 701, 7, synced_email="contato@empresa.test",
+    )
+    database.record_brevo_sync(
+        conn, "historico-listas", 801, 8, synced_email="contato@empresa.test",
+    )
+
+    class UnexpectedClient:
+        def upsert_contact(self, lead, list_id):
+            raise AssertionError("Sucesso anterior na lista automática deve ser preservado")
+
+    result = webapp._auto_sync_brevo_lead(
+        conn, "historico-listas", client=UnexpectedClient(),
     )
     conn.close()
 
