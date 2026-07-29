@@ -17,6 +17,7 @@ import ipaddress
 import json
 import re
 import socket
+import time
 import urllib.parse
 
 import requests
@@ -41,6 +42,7 @@ HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; LeadsMapsBot/1.0)"}
 # Backoff simples para nao sobrecarregar o site
 REQUEST_TIMEOUT = 8
 MAX_RESPONSE_BYTES = 1_000_000
+_monotonic = time.monotonic
 
 
 def _valid(email):
@@ -196,10 +198,14 @@ def find_email(website_url, timeout=REQUEST_TIMEOUT):
 
     base = website_url.rstrip("/")
     confirmados = set()
+    deadline = _monotonic() + max(0.0, float(timeout))
 
     for path in CANDIDATE_PATHS:
+        remaining = deadline - _monotonic()
+        if remaining <= 0:
+            break
         url = base + path
-        html = _fetch_html(url, timeout)
+        html = _fetch_html(url, remaining)
         if html is None:
             continue
 

@@ -33,6 +33,27 @@ def test_find_email_returns_three_tuple():
     assert (email, fonte, sugerido) == (None, None, None)
 
 
+def test_find_email_timeout_is_a_total_budget_for_the_site(monkeypatch):
+    elapsed = 0.0
+    received_timeouts = []
+
+    def fake_monotonic():
+        return elapsed
+
+    def slow_fetch(_url, timeout):
+        nonlocal elapsed
+        received_timeouts.append(timeout)
+        elapsed += timeout
+
+    monkeypatch.setattr(email_finder, "_is_safe_public_url", lambda _url: True)
+    monkeypatch.setattr(email_finder, "_fetch_html", slow_fetch)
+    monkeypatch.setattr(email_finder, "_monotonic", fake_monotonic, raising=False)
+
+    email_finder.find_email("https://empresa.test", timeout=8)
+
+    assert sum(received_timeouts) <= 8.0
+
+
 def test_category_translation():
     # _traduzir_categoria esta em app, mas validamos o mapeamento via database teste isolado
     CAT = {"lawyer": "Advocacia", "establishment": "Estabelecimento"}

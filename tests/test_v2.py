@@ -209,6 +209,9 @@ def test_stream_search_counts_only_new_or_upgraded_real_email_and_stops_at_targe
     conn.close()
     assert response.mimetype == "application/x-ndjson"
     assert '"phase": "concluida"' in text
+    assert '"phase": "buscando_candidatos"' in text
+    assert '"phase": "consultando_detalhes"' in text
+    assert '"phase": "verificando_site"' in text
     assert '"phase": "erro_detalhes"' in text
     assert '"new_email_leads": 2' in text
     assert calls == ["dup", "fail", "none", "upgrade", "fresh"]

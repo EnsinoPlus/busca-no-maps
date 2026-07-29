@@ -252,6 +252,7 @@ def _search_events(segment, city, uf, variations, target):
         per_variation_limit = MAX_SEARCH_CANDIDATES if len(variations) == 1 else max(1, MAX_SEARCH_CANDIDATES // len(variations))
         for variation in variations:
             if new_email >= target or api_calls >= hard_cap: break
+            yield {"phase": "buscando_candidatos", "message": f"Buscando candidatos para: {variation}", "scanned": scanned, "new_email_leads": new_email, "api_calls": api_calls, "progress": min(95, int(new_email / target * 100))}
             try:
                 with places_api.usage_recorder(reserve_google_request):
                     candidates = places_api.text_search(variation, max_results=per_variation_limit)
@@ -264,6 +265,7 @@ def _search_events(segment, city, uf, variations, target):
                 place_id = candidate.get("place_id")
                 if not place_id or place_id in seen: continue
                 seen.add(place_id)
+                yield {"phase": "consultando_detalhes", "message": f"Consultando detalhes do candidato {scanned + 1}", "scanned": scanned, "new_email_leads": new_email, "api_calls": api_calls, "progress": min(95, int(new_email / target * 100))}
                 try:
                     with places_api.usage_recorder(reserve_google_request):
                         details = places_api.place_details(place_id) or {}
@@ -276,6 +278,7 @@ def _search_events(segment, city, uf, variations, target):
                 website = details.get("website"); phone = details.get("formatted_phone_number")
                 if website:
                     database.record_api_call(conn, "website_check")
+                    yield {"phase": "verificando_site", "message": f"Verificando o site do candidato {scanned}", "scanned": scanned, "new_email_leads": new_email, "api_calls": api_calls, "progress": min(95, int(new_email / target * 100))}
                 email, source, suggested = email_finder.find_email(website) if website else (None, None, None)
                 quality = lead_quality.assess_email(email, source, website) if email else {"quality": None, "confidence": None, "domain_aligned": False, "mx_valid": None}
                 data = {"place_id": place_id, "name": details.get("name") or candidate.get("name"), "address": details.get("formatted_address") or candidate.get("formatted_address"), "phone": phone, "email": email, "email_fonte": source, "email_sugerido": suggested, "website": website, "category": ", ".join(candidate.get("types", [])[:3]), "rating": details.get("rating") or candidate.get("rating"), "ratings_total": details.get("user_ratings_total") or candidate.get("user_ratings_total"), "latitude": candidate.get("geometry", {}).get("location", {}).get("lat"), "longitude": candidate.get("geometry", {}).get("location", {}).get("lng"), "search_query": variation, "created_at": datetime.now(timezone.utc).isoformat(), "segment": segment, "city": city, "uf": uf, "email_quality": quality["quality"], "email_confidence": quality["confidence"], "email_domain_aligned": int(quality["domain_aligned"]), "email_mx_valid": None if quality["mx_valid"] is None else int(quality["mx_valid"])}
