@@ -35,6 +35,12 @@ def csrf(client, path="/"):
     return re.search(r'name="csrf_token" value="([^"]+)"', html).group(1)
 
 
+def test_https_responses_enforce_hsts():
+    response = webapp.app.test_client().get("/health", base_url="https://localhost")
+
+    assert response.headers["Strict-Transport-Security"] == "max-age=31536000; includeSubDomains"
+
+
 def test_additive_migration_adds_v2_fields_and_operational_tables(monkeypatch, tmp_path):
     db = tmp_path / "leads.db"
     conn = sqlite3.connect(db)
