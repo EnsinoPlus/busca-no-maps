@@ -148,6 +148,8 @@ def test_home_v2_has_separate_location_radar_progress_and_external_assets(monkey
     assert response.status_code == 200
     assert 'name="segment"' in html and 'name="city"' in html and 'name="uf"' in html
     assert 'name="location"' in html
+    assert 'name="limit" min="1"' in html
+    assert 'name="limit" min="1" max=' not in html
     assert 'id="search-radar"' in html and 'id="search-progress"' in html
     assert 'id="search-cancel"' in html
     assert 'src="/static/search-v2.js"' in html

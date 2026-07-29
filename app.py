@@ -53,7 +53,7 @@ AUTH_FAILURE_LIMIT = 5
 SEARCH_RATE_LIMIT = 3
 RATE_LIMIT_WINDOW = 60
 MAX_SYNC_QUERIES = 2  # compatibilidade com POST legado
-MAX_SYNC_RESULTS_PER_QUERY = 5
+DEFAULT_EMAIL_LEAD_TARGET = 5
 MAX_SEARCH_CANDIDATES = 60
 MAX_SEARCH_VARIATIONS = 3
 MAX_API_REQUESTS_PER_SEARCH = 30
@@ -192,7 +192,7 @@ def home():
     except (OSError, sqlite3.Error, AttributeError) as error:
         log.warning("Backup diário não pôde ser criado: %s", error)
     with_email = database.count_leads(conn, "com_email"); without_email = database.count_leads(conn, "sem_email")
-    body = f'''<section class="hero"><div><span class="eyebrow">Prospecção inteligente</span><h1>Encontre leads reais, sem contar duplicados.</h1><p>A quantidade solicitada conta somente contatos com e-mail. Contatos sem e-mail ficam separados mais abaixo na lista. O alvo considera apenas leads novos ou aprimorados com e-mail real.</p></div><div class="stats">{with_email} contato(s) com e-mail · {without_email} contato(s) sem e-mail, em lista separada</div></section><section class="card search-card"><form id="search-form" method="post" action="/buscar">{_csrf_input()}<div class="grid"><label>Segmento<input name="segment" maxlength="100" placeholder="Ex.: advocacia" required></label><label>Cidade<input name="city" maxlength="100" placeholder="Ex.: Mossoró" required></label><label>UF<input name="uf" maxlength="2" pattern="[A-Za-z]{{2}}" placeholder="RN" required></label><label>Localização específica<input name="location" maxlength="120" placeholder="Bairro, avenida ou região"></label></div><label>Quantidade de novos leads com e-mail<input type="number" name="limit" min="1" max="{MAX_SYNC_RESULTS_PER_QUERY}" value="5" required></label><button id="search-button" class="btn" type="submit">Iniciar varredura</button></form><section id="search-panel" class="progress-panel" hidden aria-live="polite"><div id="search-radar" class="radar"><i></i></div><div class="progress-content"><b id="search-phase">Preparando...</b><progress id="search-progress" max="100" value="0"></progress><div class="counters"><span><b id="count-scanned">0</b> analisados</span><span><b id="count-found">0</b> novos e-mails</span><span><b id="count-api">0</b> chamadas API</span></div><button id="search-cancel" class="btn secondary" type="button">Cancelar busca</button><pre id="search-log"></pre></div></section></section><script src="/static/search-v2.js" defer></script>'''
+    body = f'''<section class="hero"><div><span class="eyebrow">Prospecção inteligente</span><h1>Encontre leads reais, sem contar duplicados.</h1><p>A quantidade solicitada conta somente contatos com e-mail. Contatos sem e-mail ficam separados mais abaixo na lista. O alvo considera apenas leads novos ou aprimorados com e-mail real.</p></div><div class="stats">{with_email} contato(s) com e-mail · {without_email} contato(s) sem e-mail, em lista separada</div></section><section class="card search-card"><form id="search-form" method="post" action="/buscar">{_csrf_input()}<div class="grid"><label>Segmento<input name="segment" maxlength="100" placeholder="Ex.: advocacia" required></label><label>Cidade<input name="city" maxlength="100" placeholder="Ex.: Mossoró" required></label><label>UF<input name="uf" maxlength="2" pattern="[A-Za-z]{{2}}" placeholder="RN" required></label><label>Localização específica<input name="location" maxlength="120" placeholder="Bairro, avenida ou região"></label></div><label>Quantidade de novos leads com e-mail<input type="number" name="limit" min="1" value="{DEFAULT_EMAIL_LEAD_TARGET}" required></label><button id="search-button" class="btn" type="submit">Iniciar varredura</button></form><section id="search-panel" class="progress-panel" hidden aria-live="polite"><div id="search-radar" class="radar"><i></i></div><div class="progress-content"><b id="search-phase">Preparando...</b><progress id="search-progress" max="100" value="0"></progress><div class="counters"><span><b id="count-scanned">0</b> analisados</span><span><b id="count-found">0</b> novos e-mails</span><span><b id="count-api">0</b> chamadas API</span></div><button id="search-cancel" class="btn secondary" type="button">Cancelar busca</button><pre id="search-log"></pre></div></section></section><script src="/static/search-v2.js" defer></script>'''
     return render_page("Buscar", "prospecção v2", body)
 
 
@@ -210,9 +210,9 @@ def _parse_search_form():
         place = ", ".join(value for value in (location, city, uf) if value)
         variations = [f"{segment} em {place}", f"{segment} {city} {uf}", f"melhores {segment} em {city} {uf}"][:MAX_SEARCH_VARIATIONS]
     raw = request.form.get("limit", "").strip()
-    try: target = int(raw) if raw else MAX_SYNC_RESULTS_PER_QUERY
+    try: target = int(raw) if raw else DEFAULT_EMAIL_LEAD_TARGET
     except ValueError: abort(400, description="O limite precisa ser um número inteiro.")
-    if not 1 <= target <= MAX_SYNC_RESULTS_PER_QUERY: abort(400, description=f"O limite deve estar entre 1 e {MAX_SYNC_RESULTS_PER_QUERY}.")
+    if target < 1: abort(400, description="A quantidade deve ser de pelo menos 1 lead.")
     return segment, city, uf, variations, target
 
 

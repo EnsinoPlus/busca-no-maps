@@ -529,20 +529,14 @@ def test_buscar_enforces_small_synchronous_work_limits(monkeypatch, tmp_path):
         "/buscar",
         data={"queries": "um\ndois\ntres", "limit": "1", "csrf_token": token},
     )
-    too_many_results = client.post(
+    more_than_five = client.post(
         "/buscar",
-        data={"queries": "um", "limit": "6", "csrf_token": token},
-    )
-    default_limit = client.post(
-        "/buscar",
-        data={"queries": "um", "limit": "", "csrf_token": token},
+        data={"queries": "um", "limit": "61", "csrf_token": token},
     )
 
     assert webapp.MAX_SYNC_QUERIES == 2
-    assert webapp.MAX_SYNC_RESULTS_PER_QUERY == 5
     assert too_many_queries.status_code == 400
-    assert too_many_results.status_code == 400
-    assert default_limit.status_code == 200
+    assert more_than_five.status_code == 200
     assert received_limits == [webapp.MAX_SEARCH_CANDIDATES]
 
 
