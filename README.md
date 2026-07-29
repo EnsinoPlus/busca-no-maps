@@ -15,6 +15,7 @@ Aplicação Flask + SQLite, em PT-BR, para prospectar negócios públicos pela G
 - CSV neutralizado contra fórmulas e XLSX formatado; exportação selecionada, filtrada ou ainda não exportada;
 - painel diário persistente de requisições e custo **estimado**;
 - backup SQLite online diário/lazy e manual em `backups/`, com retenção de 30 arquivos.
+- sincronização manual e confirmada de contatos com listas do Brevo, sem disparo automático de campanhas.
 
 As migrações são aditivas e idempotentes: bancos existentes são atualizados sem apagar leads.
 
@@ -41,6 +42,8 @@ Variáveis principais (veja `.env.example`):
 - `API_MAX_REQUESTS_PER_SEARCH`: teto adicional por busca;
 - `GOOGLE_PLACES_TEXT_SEARCH_RATE` e `GOOGLE_PLACES_DETAILS_RATE`: tarifas unitárias usadas somente para estimativa;
 - `EMAIL_MX_CHECK=0`: desativa consulta MX limitada, se necessário.
+- `BREVO_API_KEY`: chave da API Brevo, usada somente no backend;
+- `BREVO_SYNC_PASSWORD`: senha exclusiva para desbloquear a sincronização na interface pública.
 
 Confirme preços e cobrança reais no Google Cloud; o painel exibe estimativas, não faturas.
 
@@ -59,6 +62,18 @@ O endpoint público de saúde é `GET /health`. Não use proxy buffering no endp
 ## Segurança
 
 A aplicação mantém autenticação fail-closed em produção, rate limiting, CSRF em todo POST, escape de HTML, URLs externas restritas a HTTP(S), bloqueios SSRF/redirect/proxy do coletor de e-mail, neutralização CSV/XLSX, limite de upload e SQLite `WAL` + `busy_timeout`. Downloads GET legados são não mutantes; somente exportação POST com CSRF marca `exported_at`. A UI de backup nunca recebe caminhos do usuário.
+
+## Integração com o Brevo
+
+1. Crie uma chave de API no Brevo e ao menos uma lista de contatos.
+2. Defina `BREVO_API_KEY` e uma senha forte e exclusiva em `BREVO_SYNC_PASSWORD` no ambiente do servidor.
+3. Abra **Brevo** na aplicação e desbloqueie a integração.
+4. Em **Leads**, selecione até 50 registros e clique em **Preparar envio ao Brevo**.
+5. Confira a quantidade com e-mail válido, escolha a lista e confirme.
+
+A autorização expira após 15 minutos e é invalidada automaticamente quando `BREVO_SYNC_PASSWORD` é alterada. A operação é idempotente por e-mail (`updateEnabled=true`): contatos existentes são atualizados em vez de duplicados. Leads sem e-mail válido são ignorados; falhas específicas de um contato não interrompem o lote, enquanto indisponibilidade, HTTP 5xx ou limite 429 interrompem os contatos restantes com segurança. A aplicação registra o identificador remoto, a lista, a última tentativa e o último erro seguro. A chave nunca é enviada ao navegador nem incluída nos logs.
+
+Esta primeira etapa somente cria/atualiza o contato e o associa a uma lista. Ela **não dispara campanhas**, não marca consentimento e não reinscreve deliberadamente contatos descadastrados. Antes de qualquer campanha, valide a base legal, a identificação do remetente, o opt-out e as supressões conforme a LGPD e as políticas do Brevo.
 
 ## Verificação
 

@@ -2,6 +2,7 @@ import csv
 import os
 import re
 import sqlite3
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
 import pytest
@@ -48,7 +49,9 @@ def test_additive_migration_adds_v2_fields_and_operational_tables(monkeypatch, t
 
     assert {"email_quality", "email_confidence", "status", "notes", "assignee", "tags",
             "last_contact_at", "next_followup_at", "exported_at", "segment", "city", "uf",
-            "normalized_email", "normalized_phone", "normalized_domain", "normalized_name_address"} <= columns
+            "normalized_email", "normalized_phone", "normalized_domain", "normalized_name_address",
+            "brevo_contact_id", "brevo_list_id", "brevo_synced_at", "brevo_last_attempt_at",
+            "brevo_sync_error"} <= columns
     assert {"api_usage", "backups"} <= tables
     assert conn.execute("SELECT name FROM leads WHERE place_id='old'").fetchone()[0] == "Legado"
     exported = tmp_path / "legacy.csv"
@@ -66,6 +69,27 @@ def test_additive_migration_adds_v2_fields_and_operational_tables(monkeypatch, t
     assert backup_conn.execute("SELECT name FROM leads WHERE place_id='old'").fetchone()[0] == "Legado"
     backup_conn.close()
     conn.close()
+
+
+def test_additive_migration_is_serialized_between_concurrent_connections(monkeypatch, tmp_path):
+    db = tmp_path / "concurrent.db"
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE leads (place_id TEXT PRIMARY KEY, name TEXT, email TEXT)")
+    conn.execute("INSERT INTO leads VALUES ('old', 'Legado', 'old@example.org')")
+    conn.commit()
+    conn.close()
+    monkeypatch.setenv("LEADS_DB_PATH", str(db))
+
+    def connect_and_read():
+        connection = database.get_connection()
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(leads)")}
+        connection.close()
+        return columns
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        results = list(pool.map(lambda _index: connect_and_read(), range(4)))
+
+    assert all("brevo_contact_id" in columns for columns in results)
 
 
 def test_email_quality_scores_source_alignment_and_mx(monkeypatch):
@@ -375,3 +399,155 @@ def test_online_backups_stay_beside_database_and_retention_is_bounded(monkeypatc
     assert all(os.path.dirname(path) == str(backup_dir) for path in paths)
     assert len(listed) == 3
     assert all(".." not in item["filename"] and "/" not in item["filename"] for item in listed)
+
+
+def test_backup_retries_transient_windows_replace_lock(monkeypatch, tmp_path):
+    conn = connect_tmp(monkeypatch, tmp_path)
+    database.upsert_lead(conn, lead())
+    real_replace = os.replace
+    attempts = []
+
+    def flaky_replace(source, target):
+        attempts.append((source, target))
+        if len(attempts) == 1:
+            raise PermissionError("arquivo temporariamente bloqueado")
+        return real_replace(source, target)
+
+    monkeypatch.setattr(database.os, "replace", flaky_replace)
+    path = database.create_backup(
+        conn,
+        now=datetime(2026, 7, 29, 12, 0, tzinfo=timezone.utc),
+    )
+    conn.close()
+
+    assert len(attempts) == 2
+    assert os.path.exists(path)
+    assert not list((tmp_path / "backups").glob("*.tmp"))
+
+
+def test_backups_created_at_same_instant_have_unique_files(monkeypatch, tmp_path):
+    conn = connect_tmp(monkeypatch, tmp_path)
+    database.upsert_lead(conn, lead())
+    instant = datetime(2026, 7, 29, 12, 30, tzinfo=timezone.utc)
+
+    first = database.create_backup(conn, now=instant)
+    second = database.create_backup(conn, now=instant)
+    conn.close()
+
+    assert first != second
+    assert os.path.exists(first)
+    assert os.path.exists(second)
+    assert len(database.list_backups()) == 2
+
+
+def test_backup_retention_tolerates_file_removed_by_another_process(monkeypatch, tmp_path):
+    conn = connect_tmp(monkeypatch, tmp_path)
+    database.upsert_lead(conn, lead())
+    for index in range(2):
+        database.create_backup(
+            conn,
+            retention=2,
+            now=datetime(2026, 7, 29, 13, 0, index, tzinfo=timezone.utc),
+        )
+    real_unlink = os.unlink
+    raced = False
+
+    def concurrent_unlink(path):
+        nonlocal raced
+        if not raced and path.endswith(".db"):
+            raced = True
+            real_unlink(path)
+            raise FileNotFoundError(path)
+        return real_unlink(path)
+
+    monkeypatch.setattr(database.os, "unlink", concurrent_unlink)
+    database.create_backup(
+        conn,
+        retention=2,
+        now=datetime(2026, 7, 29, 13, 0, 2, tzinfo=timezone.utc),
+    )
+    conn.close()
+
+    assert raced
+    assert len(database.list_backups()) == 2
+
+
+def test_backup_retention_tolerates_file_locked_by_another_process(monkeypatch, tmp_path):
+    conn = connect_tmp(monkeypatch, tmp_path)
+    database.upsert_lead(conn, lead())
+    for index in range(2):
+        database.create_backup(
+            conn,
+            retention=2,
+            now=datetime(2026, 7, 29, 13, 30, index, tzinfo=timezone.utc),
+        )
+    real_unlink = os.unlink
+    attempts = 0
+
+    def locked_unlink(path):
+        nonlocal attempts
+        if path.endswith(".db"):
+            attempts += 1
+            raise PermissionError("arquivo bloqueado por outro processo")
+        return real_unlink(path)
+
+    monkeypatch.setattr(database.os, "unlink", locked_unlink)
+    database.create_backup(
+        conn,
+        retention=2,
+        now=datetime(2026, 7, 29, 13, 30, 2, tzinfo=timezone.utc),
+    )
+    conn.close()
+
+    assert attempts >= 1
+
+
+def test_backup_metadata_tolerates_target_removed_by_concurrent_retention(monkeypatch, tmp_path):
+    conn = connect_tmp(monkeypatch, tmp_path)
+    database.upsert_lead(conn, lead())
+    real_getsize = os.path.getsize
+
+    def concurrent_getsize(path):
+        if path.endswith(".db"):
+            raise FileNotFoundError(path)
+        return real_getsize(path)
+
+    monkeypatch.setattr(database.os.path, "getsize", concurrent_getsize)
+    path = database.create_backup(
+        conn,
+        retention=1,
+        now=datetime(2026, 7, 29, 14, 0, tzinfo=timezone.utc),
+    )
+    conn.close()
+
+    assert path.endswith(".db")
+
+
+def test_list_backups_tolerates_file_removed_during_size_read(monkeypatch, tmp_path):
+    conn = connect_tmp(monkeypatch, tmp_path)
+    database.upsert_lead(conn, lead())
+    first = database.create_backup(
+        conn,
+        now=datetime(2026, 7, 29, 14, 30, 0, tzinfo=timezone.utc),
+    )
+    database.create_backup(
+        conn,
+        now=datetime(2026, 7, 29, 14, 30, 1, tzinfo=timezone.utc),
+    )
+    conn.close()
+    real_getsize = os.path.getsize
+    removed = False
+
+    def concurrent_getsize(path):
+        nonlocal removed
+        if not removed and path == first:
+            removed = True
+            os.unlink(path)
+            raise FileNotFoundError(path)
+        return real_getsize(path)
+
+    monkeypatch.setattr(database.os.path, "getsize", concurrent_getsize)
+    listed = database.list_backups()
+
+    assert removed
+    assert len(listed) == 1

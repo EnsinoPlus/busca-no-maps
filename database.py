@@ -2,7 +2,10 @@
 import csv
 import os
 import re
+import secrets
 import sqlite3
+import threading
+import time
 import unicodedata
 import urllib.parse
 from datetime import datetime, timezone
@@ -34,7 +37,13 @@ EXPECTED_COLUMNS = {
     "next_followup_at": "TEXT", "exported_at": "TEXT", "normalized_email": "TEXT",
     "normalized_phone": "TEXT", "normalized_domain": "TEXT",
     "normalized_name_address": "TEXT",
+    "brevo_contact_id": "TEXT", "brevo_list_id": "INTEGER", "brevo_synced_at": "TEXT",
+    "brevo_last_attempt_at": "TEXT", "brevo_sync_error": "TEXT",
 }
+_SCHEMA_LOCK = threading.Lock()
+BACKUP_FILENAME_RE = re.compile(
+    r"leads-\d{8}-\d{6}-\d{6}(?:-\d+-[0-9a-f]{8})?\.db"
+)
 
 
 def get_db_path():
@@ -68,39 +77,45 @@ def normalize_name_address(name, address):
 
 
 def _migrate(conn):
-    existing = {row[1] for row in conn.execute("PRAGMA table_info(leads)")}
-    for column, column_type in EXPECTED_COLUMNS.items():
-        if column not in existing:
-            # Tipos vêm de constante interna, nunca de entrada do usuário.
-            conn.execute(f"ALTER TABLE leads ADD COLUMN {column} {column_type}")
-    conn.executescript("""
-        CREATE TABLE IF NOT EXISTS api_usage (
-            day TEXT NOT NULL, endpoint TEXT NOT NULL, requests INTEGER NOT NULL DEFAULT 0,
-            units INTEGER NOT NULL DEFAULT 0, estimated_cost REAL NOT NULL DEFAULT 0,
-            PRIMARY KEY(day, endpoint)
-        );
-        CREATE TABLE IF NOT EXISTS backups (
-            filename TEXT PRIMARY KEY, created_at TEXT NOT NULL, size_bytes INTEGER NOT NULL
-        );
-        CREATE INDEX IF NOT EXISTS idx_leads_email ON leads(normalized_email);
-        CREATE INDEX IF NOT EXISTS idx_leads_phone ON leads(normalized_phone);
-        CREATE INDEX IF NOT EXISTS idx_leads_domain ON leads(normalized_domain);
-        CREATE INDEX IF NOT EXISTS idx_leads_name_address ON leads(normalized_name_address);
-        CREATE INDEX IF NOT EXISTS idx_leads_created ON leads(created_at);
-    """)
-    rows = conn.execute(
-        "SELECT place_id,name,address,phone,email,website FROM leads WHERE "
-        "normalized_email IS NULL OR normalized_phone IS NULL OR "
-        "normalized_domain IS NULL OR normalized_name_address IS NULL"
-    ).fetchall()
-    for pid, name, address, phone, email, website in rows:
-        conn.execute(
-            "UPDATE leads SET normalized_email=?,normalized_phone=?,normalized_domain=?,"
-            "normalized_name_address=?,status=COALESCE(NULLIF(status,''),'novo') WHERE place_id=?",
-            (normalize_email(email), normalize_phone(phone), normalize_domain(website or email),
-             normalize_name_address(name, address), pid),
-        )
-    conn.commit()
+    # Serializa migrações entre threads/processos antes de observar colunas ausentes.
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        existing = {row[1] for row in conn.execute("PRAGMA table_info(leads)")}
+        for column, column_type in EXPECTED_COLUMNS.items():
+            if column not in existing:
+                # Tipos vêm de constante interna, nunca de entrada do usuário.
+                conn.execute(f"ALTER TABLE leads ADD COLUMN {column} {column_type}")
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS api_usage (
+                day TEXT NOT NULL, endpoint TEXT NOT NULL, requests INTEGER NOT NULL DEFAULT 0,
+                units INTEGER NOT NULL DEFAULT 0, estimated_cost REAL NOT NULL DEFAULT 0,
+                PRIMARY KEY(day, endpoint)
+            );
+            CREATE TABLE IF NOT EXISTS backups (
+                filename TEXT PRIMARY KEY, created_at TEXT NOT NULL, size_bytes INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_leads_email ON leads(normalized_email);
+            CREATE INDEX IF NOT EXISTS idx_leads_phone ON leads(normalized_phone);
+            CREATE INDEX IF NOT EXISTS idx_leads_domain ON leads(normalized_domain);
+            CREATE INDEX IF NOT EXISTS idx_leads_name_address ON leads(normalized_name_address);
+            CREATE INDEX IF NOT EXISTS idx_leads_created ON leads(created_at);
+        """)
+        rows = conn.execute(
+            "SELECT place_id,name,address,phone,email,website FROM leads WHERE "
+            "normalized_email IS NULL OR normalized_phone IS NULL OR "
+            "normalized_domain IS NULL OR normalized_name_address IS NULL"
+        ).fetchall()
+        for pid, name, address, phone, email, website in rows:
+            conn.execute(
+                "UPDATE leads SET normalized_email=?,normalized_phone=?,normalized_domain=?,"
+                "normalized_name_address=?,status=COALESCE(NULLIF(status,''),'novo') WHERE place_id=?",
+                (normalize_email(email), normalize_phone(phone), normalize_domain(website or email),
+                 normalize_name_address(name, address), pid),
+            )
+        conn.commit()
+    except sqlite3.Error:
+        conn.rollback()
+        raise
 
 
 def get_connection():
@@ -109,13 +124,14 @@ def get_connection():
     conn = sqlite3.connect(path, timeout=5)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA busy_timeout = 5000")
-    conn.execute("PRAGMA journal_mode = WAL")
     conn.execute("PRAGMA foreign_keys = ON")
-    conn.execute(SCHEMA)
-    existing = {row[1] for row in conn.execute("PRAGMA table_info(leads)")}
-    if set(EXPECTED_COLUMNS) - existing and conn.execute("SELECT EXISTS(SELECT 1 FROM leads)").fetchone()[0]:
-        create_backup(conn, retention=30)
-    _migrate(conn)
+    with _SCHEMA_LOCK:
+        conn.execute("PRAGMA journal_mode = WAL")
+        conn.execute(SCHEMA)
+        existing = {row[1] for row in conn.execute("PRAGMA table_info(leads)")}
+        if set(EXPECTED_COLUMNS) - existing and conn.execute("SELECT EXISTS(SELECT 1 FROM leads)").fetchone()[0]:
+            create_backup(conn, retention=30)
+        _migrate(conn)
     return conn
 
 
@@ -262,6 +278,23 @@ def update_lead_crm(conn, place_id, fields):
     return cur.rowcount == 1
 
 
+def record_brevo_sync(conn, place_id, contact_id, list_id, error=None, attempted_at=None):
+    attempted_at = attempted_at or datetime.now(timezone.utc).isoformat()
+    if error:
+        cur = conn.execute(
+            "UPDATE leads SET brevo_last_attempt_at=?,brevo_sync_error=? WHERE place_id=?",
+            (attempted_at, str(error)[:500], place_id),
+        )
+    else:
+        cur = conn.execute(
+            "UPDATE leads SET brevo_contact_id=?,brevo_list_id=?,brevo_synced_at=?,"
+            "brevo_last_attempt_at=?,brevo_sync_error=NULL WHERE place_id=?",
+            (str(contact_id) if contact_id is not None else None, int(list_id), attempted_at, attempted_at, place_id),
+        )
+    conn.commit()
+    return cur.rowcount == 1
+
+
 def safe_cell(value):
     if isinstance(value, str) and value.lstrip().startswith(("=", "+", "-", "@", "\t", "\r")):
         return "'" + value
@@ -351,11 +384,35 @@ def api_usage_summary(conn, day=None):
     return {"day": day, "requests": sum(r[1] for r in rows), "api_requests": api_requests, "units": sum(r[2] for r in rows), "estimated_cost": sum(r[3] for r in rows), "rows": rows}
 
 
+def _replace_with_retry(source, target, attempts=5):
+    for attempt in range(attempts):
+        try:
+            os.replace(source, target)
+            return
+        except PermissionError:
+            if attempt == attempts - 1:
+                raise
+            time.sleep(0.05 * (attempt + 1))
+
+
+def _remove_stale_backup(path, attempts=5):
+    for attempt in range(attempts):
+        try:
+            os.unlink(path)
+            return
+        except FileNotFoundError:
+            return
+        except PermissionError:
+            if attempt == attempts - 1:
+                return
+            time.sleep(0.05 * (attempt + 1))
+
+
 def create_backup(conn=None, retention=30, now=None):
     source = get_db_path(); folder = os.path.join(os.path.dirname(source), "backups")
     os.makedirs(folder, exist_ok=True)
     now = now or datetime.now(timezone.utc)
-    filename = f"leads-{now.strftime('%Y%m%d-%H%M%S-%f')}.db"
+    filename = f"leads-{now.strftime('%Y%m%d-%H%M%S-%f')}-{os.getpid()}-{secrets.token_hex(4)}.db"
     target = os.path.join(folder, filename)
     temporary = target + ".tmp"
     source_conn = conn or get_connection()
@@ -368,7 +425,7 @@ def create_backup(conn=None, retention=30, now=None):
             raise sqlite3.DatabaseError(f"Backup inválido: {integrity}")
         destination.close()
         destination = None
-        os.replace(temporary, target)
+        _replace_with_retry(temporary, target)
     except (OSError, sqlite3.Error):
         if destination is not None:
             destination.close()
@@ -377,13 +434,23 @@ def create_backup(conn=None, retention=30, now=None):
         raise
     finally:
         if conn is None: source_conn.close()
-    files = sorted((f for f in os.listdir(folder) if re.fullmatch(r"leads-\d{8}-\d{6}-\d{6}\.db", f)), reverse=True)
-    for stale in files[max(1, retention):]: os.unlink(os.path.join(folder, stale))
+    files = sorted((f for f in os.listdir(folder) if BACKUP_FILENAME_RE.fullmatch(f)), reverse=True)
+    for stale in files[max(1, retention):]:
+        _remove_stale_backup(os.path.join(folder, stale))
     has_backup_table = conn is not None and conn.execute(
         "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='backups')"
     ).fetchone()[0]
     if has_backup_table:
-        conn.execute("INSERT OR REPLACE INTO backups VALUES(?,?,?)", (filename, now.isoformat(), os.path.getsize(target))); conn.commit()
+        try:
+            size_bytes = os.path.getsize(target)
+        except FileNotFoundError:
+            pass
+        else:
+            conn.execute(
+                "INSERT OR REPLACE INTO backups VALUES(?,?,?)",
+                (filename, now.isoformat(), size_bytes),
+            )
+            conn.commit()
     return target
 
 
@@ -397,7 +464,16 @@ def maybe_daily_backup(conn):
 def list_backups():
     folder = os.path.join(os.path.dirname(get_db_path()), "backups")
     if not os.path.isdir(folder): return []
-    return [{"filename": f, "size_bytes": os.path.getsize(os.path.join(folder, f))} for f in sorted(os.listdir(folder), reverse=True) if re.fullmatch(r"leads-\d{8}-\d{6}-\d{6}\.db", f)]
+    backups = []
+    for filename in sorted(os.listdir(folder), reverse=True):
+        if not BACKUP_FILENAME_RE.fullmatch(filename):
+            continue
+        try:
+            size_bytes = os.path.getsize(os.path.join(folder, filename))
+        except (FileNotFoundError, PermissionError):
+            continue
+        backups.append({"filename": filename, "size_bytes": size_bytes})
+    return backups
 
 
 def limpar_emails(conn, import_urllib=None):

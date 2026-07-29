@@ -1,4 +1,5 @@
 """Interface web PT-BR do Leads Maps v2."""
+import hashlib
 import hmac
 import json
 import logging
@@ -39,6 +40,7 @@ def _load_env():
 
 
 _load_env()
+import brevo_api
 import database
 import email_finder
 import lead_quality
@@ -57,6 +59,8 @@ DEFAULT_EMAIL_LEAD_TARGET = 5
 MAX_SEARCH_CANDIDATES = 60
 MAX_SEARCH_VARIATIONS = 3
 MAX_API_REQUESTS_PER_SEARCH = 30
+MAX_BREVO_SYNC_CONTACTS = 50
+BREVO_UNLOCK_TTL_SECONDS = 15 * 60
 PAGE_SIZE = 25
 _rate_limit_events = defaultdict(deque)
 _rate_limit_lock = threading.Lock()
@@ -165,7 +169,7 @@ def _safe_http_url(value):
 
 def render_page(title, subtitle, body):
     warning = "" if _checar_api_key() else '<div class="warn">GOOGLE_MAPS_API_KEY não configurada. As buscas não funcionarão.</div>'
-    return f'''<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{escape(title)} · Leads Maps</title><link rel="stylesheet" href="/static/app.css"></head><body><header class="topbar"><a class="brand" href="/">Leads Maps <small>{escape(subtitle)}</small></a><nav><a href="/">Buscar</a><a href="/leads">Leads</a><a href="/exportar">Exportar</a><a href="/dashboard">Uso da API</a><a href="/backups">Backups</a></nav></header><main class="wrap">{warning}{body}</main></body></html>'''
+    return f'''<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{escape(title)} · Leads Maps</title><link rel="stylesheet" href="/static/app.css"></head><body><header class="topbar"><a class="brand" href="/">Leads Maps <small>{escape(subtitle)}</small></a><nav><a href="/">Buscar</a><a href="/leads">Leads</a><a href="/brevo">Brevo</a><a href="/exportar">Exportar</a><a href="/dashboard">Uso da API</a><a href="/backups">Backups</a></nav></header><main class="wrap">{warning}{body}</main></body></html>'''
 
 
 def _render_tabela(rows):
@@ -353,7 +357,11 @@ def _crm_table(rows):
     for row in rows:
         site = _safe_http_url(row["website"])
         quality = row["email_quality"] or "-"
-        items.append(f'''<tr><td><input type="checkbox" name="ids" value="{escape(row['place_id'])}" form="export-selection"></td><td><b>{escape(row['name'] or '-')}</b><small>{escape(row['city'] or '')}/{escape(row['uf'] or '')}</small></td><td>{escape(row['email'] or 'sem e-mail')}<small>Qualidade: {escape(quality)} · {escape(row['email_confidence'] if row['email_confidence'] is not None else '-')}%</small></td><td>{escape(row['phone'] or '-')} · {f'<a href="{escape(site)}" target="_blank" rel="noopener noreferrer">site</a>' if site else '-'}</td><td><form method="post" action="/leads/{urllib.parse.quote(row['place_id'], safe='')}/editar">{_csrf_input()}{_select('status', status_options, row['status'])}<input name="assignee" value="{escape(row['assignee'] or '')}" placeholder="Responsável"><input name="tags" value="{escape(row['tags'] or '')}" placeholder="Tags"><textarea name="notes" placeholder="Notas">{escape(row['notes'] or '')}</textarea><label>Último contato<input type="datetime-local" name="last_contact_at" value="{escape((row['last_contact_at'] or '')[:16])}"></label><label>Próximo follow-up<input type="datetime-local" name="next_followup_at" value="{escape((row['next_followup_at'] or '')[:16])}"></label><button class="btn small" type="submit">Salvar</button></form></td></tr>''')
+        if row["brevo_sync_error"]:
+            brevo_status = "Falha na última tentativa; sincronizado anteriormente" if row["brevo_synced_at"] else "Falha na última tentativa"
+        else:
+            brevo_status = "Sincronizado" if row["brevo_synced_at"] else "Não sincronizado"
+        items.append(f'''<tr><td><input type="checkbox" name="ids" value="{escape(row['place_id'])}" form="export-selection"></td><td><b>{escape(row['name'] or '-')}</b><small>{escape(row['city'] or '')}/{escape(row['uf'] or '')}</small></td><td>{escape(row['email'] or 'sem e-mail')}<small>Qualidade: {escape(quality)} · {escape(row['email_confidence'] if row['email_confidence'] is not None else '-')}% · Brevo: {escape(brevo_status)}</small></td><td>{escape(row['phone'] or '-')} · {f'<a href="{escape(site)}" target="_blank" rel="noopener noreferrer">site</a>' if site else '-'}</td><td><form method="post" action="/leads/{urllib.parse.quote(row['place_id'], safe='')}/editar">{_csrf_input()}{_select('status', status_options, row['status'])}<input name="assignee" value="{escape(row['assignee'] or '')}" placeholder="Responsável"><input name="tags" value="{escape(row['tags'] or '')}" placeholder="Tags"><textarea name="notes" placeholder="Notas">{escape(row['notes'] or '')}</textarea><label>Último contato<input type="datetime-local" name="last_contact_at" value="{escape((row['last_contact_at'] or '')[:16])}"></label><label>Próximo follow-up<input type="datetime-local" name="next_followup_at" value="{escape((row['next_followup_at'] or '')[:16])}"></label><button class="btn small" type="submit">Salvar</button></form></td></tr>''')
     return '<div class="table-scroll"><table><thead><tr><th>Sel.</th><th>Lead</th><th>E-mail</th><th>Contato</th><th>Funil e acompanhamento</th></tr></thead><tbody>' + "".join(items) + "</tbody></table></div>"
 
 
@@ -368,8 +376,174 @@ def leads():
     bool_choices = [("sim", "Sim"), ("nao", "Não")]
     status_choices = [(status, status.replace("_", " ").title()) for status in database.FUNNEL_STATUSES]
     filter_hidden = "".join(f'<input type="hidden" name="{escape(key)}" value="{escape(value)}">' for key, value in filters.items())
-    body = f'''<section class="card"><h1>Leads</h1><form class="filters" method="get"><label>E-mail{_select('email', email_choices, filters.get('email'))}</label><label>Qualidade{_select('quality', quality_choices, filters.get('quality'))}</label><label>Telefone{_select('phone', bool_choices, filters.get('phone'))}</label><label>Site{_select('site', bool_choices, filters.get('site'))}</label><label>Nota mínima<input type="number" step="0.1" min="0" max="5" name="rating_min" value="{escape(filters.get('rating_min',''))}"></label><label>Segmento<input name="segment" value="{escape(filters.get('segment',''))}"></label><label>Cidade<input name="city" value="{escape(filters.get('city',''))}"></label><label>UF<input name="uf" maxlength="2" value="{escape(filters.get('uf',''))}"></label><label>Status{_select('status', status_choices, filters.get('status'))}</label><label>Exportado{_select('exported', bool_choices, filters.get('exported'))}</label><label>Desde<input type="date" name="date_from" value="{escape(filters.get('date_from',''))}"></label><label>Até<input type="date" name="date_to" value="{escape(filters.get('date_to',''))}"></label><label>Follow-up{_select('followup', [('atrasado','Atrasado'),('agendado','Agendado')], filters.get('followup'))}</label><label>Busca<input name="busca" value="{escape(filters.get('busca',''))}"></label><button class="btn" type="submit">Filtrar</button></form><form method="post" action="/exportar">{_csrf_input()}<input type="hidden" name="scope" value="filtered"><input type="hidden" name="format" value="xlsx">{filter_hidden}<button class="btn secondary" type="submit">Exportar filtro atual</button></form></section><section class="card"><form id="export-selection" method="post" action="/exportar"><input type="hidden" name="csrf_token" value="{_csrf_token()}"><input type="hidden" name="scope" value="selected"><button class="btn secondary" type="submit" name="format" value="xlsx">Exportar selecionados</button></form><p><b>{len(rows)}</b> resultado(s); os leads com e-mail aparecem primeiro.</p>{_crm_table(rows)}</section>'''
+    summary = ""
+    try:
+        brevo_ok = max(0, min(MAX_BREVO_SYNC_CONTACTS, int(request.args.get("brevo_ok", "0"))))
+        brevo_error = max(0, min(MAX_BREVO_SYNC_CONTACTS, int(request.args.get("brevo_erro", "0"))))
+        brevo_ignored = max(0, min(MAX_BREVO_SYNC_CONTACTS, int(request.args.get("brevo_ignorado", "0"))))
+        brevo_pending = max(0, min(MAX_BREVO_SYNC_CONTACTS, int(request.args.get("brevo_pendente", "0"))))
+    except ValueError:
+        brevo_ok = brevo_error = brevo_ignored = brevo_pending = 0
+    if brevo_ok or brevo_error or brevo_ignored or brevo_pending:
+        summary = f'<div class="stats">{brevo_ok} sincronizado(s) com o Brevo · {brevo_error} erro(s) · {brevo_ignored} ignorado(s) sem e-mail válido · {brevo_pending} não processado(s) após interrupção segura</div>'
+    body = f'''{summary}<section class="card"><h1>Leads</h1><form class="filters" method="get"><label>E-mail{_select('email', email_choices, filters.get('email'))}</label><label>Qualidade{_select('quality', quality_choices, filters.get('quality'))}</label><label>Telefone{_select('phone', bool_choices, filters.get('phone'))}</label><label>Site{_select('site', bool_choices, filters.get('site'))}</label><label>Nota mínima<input type="number" step="0.1" min="0" max="5" name="rating_min" value="{escape(filters.get('rating_min',''))}"></label><label>Segmento<input name="segment" value="{escape(filters.get('segment',''))}"></label><label>Cidade<input name="city" value="{escape(filters.get('city',''))}"></label><label>UF<input name="uf" maxlength="2" value="{escape(filters.get('uf',''))}"></label><label>Status{_select('status', status_choices, filters.get('status'))}</label><label>Exportado{_select('exported', bool_choices, filters.get('exported'))}</label><label>Desde<input type="date" name="date_from" value="{escape(filters.get('date_from',''))}"></label><label>Até<input type="date" name="date_to" value="{escape(filters.get('date_to',''))}"></label><label>Follow-up{_select('followup', [('atrasado','Atrasado'),('agendado','Agendado')], filters.get('followup'))}</label><label>Busca<input name="busca" value="{escape(filters.get('busca',''))}"></label><button class="btn" type="submit">Filtrar</button></form><form method="post" action="/exportar">{_csrf_input()}<input type="hidden" name="scope" value="filtered"><input type="hidden" name="format" value="xlsx">{filter_hidden}<button class="btn secondary" type="submit">Exportar filtro atual</button></form></section><section class="card"><form id="export-selection" method="post" action="/exportar"><input type="hidden" name="csrf_token" value="{_csrf_token()}"><input type="hidden" name="scope" value="selected"><button class="btn secondary" type="submit" name="format" value="xlsx">Exportar selecionados</button><button class="btn secondary" type="submit" formaction="/brevo/preparar">Preparar envio ao Brevo</button></form><p><b>{len(rows)}</b> resultado(s). Contatos com e-mail aparecem primeiro; sem e-mail continuam em grupo inferior.</p>{_crm_table(rows)}</section>'''
     return render_page("Leads", f"{len(rows)} encontrados", body)
+
+
+def _brevo_password_fingerprint(password):
+    secret = app.secret_key if isinstance(app.secret_key, bytes) else str(app.secret_key).encode("utf-8")
+    return hmac.new(secret, str(password).encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def _clear_brevo_session():
+    for key in (
+        "brevo_unlocked", "brevo_unlocked_at", "brevo_password_fingerprint",
+        "brevo_list_ids", "brevo_lead_ids",
+    ):
+        session.pop(key, None)
+
+
+def _mark_brevo_unlocked():
+    password = os.environ.get("BREVO_SYNC_PASSWORD", "")
+    session["brevo_unlocked"] = True
+    session["brevo_unlocked_at"] = time.time()
+    session["brevo_password_fingerprint"] = _brevo_password_fingerprint(password)
+
+
+def _brevo_unlocked():
+    password = os.environ.get("BREVO_SYNC_PASSWORD", "")
+    try:
+        unlocked_at = float(session.get("brevo_unlocked_at", 0))
+    except (TypeError, ValueError):
+        unlocked_at = 0
+    fingerprint = str(session.get("brevo_password_fingerprint", ""))
+    valid = bool(
+        session.get("brevo_unlocked")
+        and password
+        and 0 <= time.time() - unlocked_at <= BREVO_UNLOCK_TTL_SECONDS
+        and hmac.compare_digest(fingerprint, _brevo_password_fingerprint(password))
+    )
+    if not valid:
+        _clear_brevo_session()
+    return valid
+
+
+def _brevo_client():
+    api_key = os.environ.get("BREVO_API_KEY", "").strip()
+    if not api_key:
+        abort(503, description="Integração Brevo não configurada.")
+    return brevo_api.BrevoClient(api_key)
+
+
+def _require_brevo_unlocked():
+    if not _brevo_unlocked():
+        abort(403, description="Desbloqueie a integração Brevo antes de sincronizar.")
+
+
+@app.get("/brevo")
+def brevo_page():
+    configured = bool(os.environ.get("BREVO_API_KEY", "").strip() and os.environ.get("BREVO_SYNC_PASSWORD", ""))
+    if not configured:
+        body = "<section class=\"card\"><h1>Brevo</h1><p>Integração ainda não configurada. Defina BREVO_API_KEY e BREVO_SYNC_PASSWORD no ambiente do servidor.</p></section>"
+    elif not _brevo_unlocked():
+        body = f'''<section class="card"><h1>Desbloquear Brevo</h1><p>Esta senha protege a sincronização porque a página principal é pública.</p><form method="post" action="/brevo/desbloquear">{_csrf_input()}<label>Senha da integração<input type="password" name="password" autocomplete="current-password" required></label><button class="btn" type="submit">Desbloquear</button></form></section>'''
+    else:
+        body = f'''<section class="card"><h1>Brevo conectado</h1><p>Selecione os contatos na página de leads e use “Preparar envio ao Brevo”. Nenhuma campanha é disparada automaticamente.</p><a class="btn" href="/leads">Selecionar contatos</a><form method="post" action="/brevo/sair">{_csrf_input()}<button class="btn secondary" type="submit">Bloquear integração</button></form></section>'''
+    return render_page("Brevo", "sincronização manual", body)
+
+
+@app.post("/brevo/desbloquear")
+def brevo_unlock():
+    expected = os.environ.get("BREVO_SYNC_PASSWORD", "")
+    if not expected or not os.environ.get("BREVO_API_KEY", "").strip():
+        abort(503, description="Integração Brevo não configurada.")
+    if not _rate_limit_allows("brevo_unlock", request.remote_addr or "unknown", AUTH_FAILURE_LIMIT):
+        return Response("Muitas tentativas.", status=429, headers={"Retry-After": "60"})
+    received = request.form.get("password", "")
+    if not hmac.compare_digest(received, expected):
+        abort(403, description="Senha da integração inválida.")
+    _mark_brevo_unlocked()
+    return redirect(url_for("brevo_page"))
+
+
+@app.post("/brevo/sair")
+def brevo_lock():
+    _clear_brevo_session()
+    return redirect(url_for("brevo_page"))
+
+
+def _selected_brevo_ids():
+    ids = [value for value in request.form.getlist("ids") if value]
+    if not 1 <= len(ids) <= MAX_BREVO_SYNC_CONTACTS:
+        abort(400, description=f"Selecione de 1 a {MAX_BREVO_SYNC_CONTACTS} leads.")
+    return list(dict.fromkeys(ids))
+
+
+@app.post("/brevo/preparar")
+def brevo_prepare():
+    _require_brevo_unlocked()
+    ids = _selected_brevo_ids()
+    rows = database.query_lead_records(_get_db(), {"ids": ids})
+    if not rows:
+        abort(404)
+    try:
+        lists = _brevo_client().list_contact_lists()
+    except brevo_api.BrevoAPIError as error:
+        abort(502, description=str(error))
+    if not lists:
+        abort(400, description="Crie ao menos uma lista de contatos no Brevo.")
+    session["brevo_list_ids"] = [item["id"] for item in lists]
+    session["brevo_lead_ids"] = [row["place_id"] for row in rows]
+    hidden_ids = "".join(f'<input type="hidden" name="ids" value="{escape(row["place_id"])}">' for row in rows)
+    options = "".join(f'<option value="{item["id"]}">{escape(item["name"])}</option>' for item in lists)
+    eligible = sum(brevo_api.is_valid_email(row["email"]) for row in rows)
+    body = f'''<section class="card"><h1>Confirmar sincronização</h1><p>{eligible} de {len(rows)} lead(s) selecionado(s) possuem e-mail válido e poderão ser sincronizados. Os demais serão ignorados.</p><p>Esta ação cria ou atualiza contatos e os adiciona à lista escolhida. Ela não envia campanhas.</p><form method="post" action="/brevo/sincronizar">{_csrf_input()}{hidden_ids}<label>Lista do Brevo<select name="list_id" required>{options}</select></label><button class="btn" type="submit">Confirmar sincronização</button></form></section>'''
+    return render_page("Brevo", "confirmação obrigatória", body)
+
+
+@app.post("/brevo/sincronizar")
+def brevo_sync():
+    _require_brevo_unlocked()
+    if not _rate_limit_allows("brevo_sync", request.remote_addr or "unknown", 5):
+        return Response("Muitas sincronizações.", status=429, headers={"Retry-After": "60"})
+    ids = _selected_brevo_ids()
+    if set(ids) != set(session.get("brevo_lead_ids", [])):
+        abort(400, description="Confirme novamente os contatos selecionados.")
+    try:
+        list_id = int(request.form.get("list_id", ""))
+    except ValueError:
+        abort(400, description="Lista do Brevo inválida.")
+    if list_id not in session.get("brevo_list_ids", []):
+        abort(400, description="Confirme novamente a lista do Brevo.")
+    conn = _get_db()
+    rows = database.query_lead_records(conn, {"ids": ids})
+    client = _brevo_client()
+    ok = errors = ignored = pending = 0
+    for index, row in enumerate(rows):
+        if not brevo_api.is_valid_email(row["email"]):
+            ignored += 1
+            continue
+        try:
+            result = client.upsert_contact(dict(row), list_id)
+            database.record_brevo_sync(conn, row["place_id"], result.get("id"), list_id)
+            ok += 1
+        except (brevo_api.BrevoAPIError, ValueError) as error:
+            database.record_brevo_sync(conn, row["place_id"], None, list_id, error=str(error))
+            errors += 1
+            status_code = getattr(error, "status_code", None)
+            systemic_error = isinstance(error, brevo_api.BrevoAPIError) and (
+                status_code is None or status_code not in {400, 409, 422}
+            )
+            if systemic_error:
+                remaining = rows[index + 1:]
+                pending += sum(brevo_api.is_valid_email(item["email"]) for item in remaining)
+                ignored += sum(not brevo_api.is_valid_email(item["email"]) for item in remaining)
+                break
+    session.pop("brevo_list_ids", None)
+    session.pop("brevo_lead_ids", None)
+    return redirect(url_for(
+        "leads", brevo_ok=ok, brevo_erro=errors, brevo_ignorado=ignored, brevo_pendente=pending,
+    ))
 
 
 @app.post("/leads/<path:place_id>/editar")
